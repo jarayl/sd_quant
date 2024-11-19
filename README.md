@@ -1,3 +1,47 @@
+# Usage for sd_quant
+
+If using the FASRC cluster, set that up first in the *Using the FASRC cluster* section.
+
+## Set up
+
+Create an environment via
+```
+conda env create -f env.yaml
+```
+Download the Stable Diffusion v2.1 [base checkpoint](https://huggingface.co/stabilityai/stable-diffusion-2-1-base/blob/main/v2-1_512-nonema-pruned.ckpt) to the checkpoints/ directory:
+```
+mkdir checkpoints
+cd checkpoints
+wget https://huggingface.co/stabilityai/stable-diffusion-2-1-base/resolve/main/v2-1_512-nonema-pruned.ckpt
+cd ..
+```
+And download the COCO dataset via
+```
+bash data/coco.sh
+```
+Downloading the data actually takes a really long time, so if using the FASRC cluster, I recommend doing so before requesting a partition.
+
+For now the only script we have to run is `txt2img.py`, e.g., run the following command to generate some images to the `outputs/` directory:
+```
+python scripts/txt2img.py --prompt "a professional photograph of an astronaut riding a horse" --ckpt checkpoints/v2-1_512-nonema-pruned.ckpt --config configs/stable-diffusion/v2-inference.yaml --device cuda
+```
+
+## Using the FASRC cluster
+
+Once you get to a login node, you request a GPU via
+```
+salloc -p gpu_test -t 0-1:00 --mem 40000 --gres=gpu:1
+```
+Once in, you may confirm you GPU's details with command `nvidia-smi`, and then set up mamba for managing packages via
+```
+module load python/3.10.13-fasrc01
+```
+Now you may use the usual conda commands to set up the environment.
+
+For some more info, see [here](https://github.com/fasrc/User_Codes/tree/master/AI/PyTorch).
+
+
+
 # Stable Diffusion Version 2
 ![t2i](assets/stable-samples/txt2img/768/merged-0006.png)
 ![t2i](assets/stable-samples/txt2img/768/merged-0002.png)
