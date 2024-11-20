@@ -76,6 +76,10 @@ class DDIMSampler(object):
                unconditional_conditioning=None, # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                dynamic_threshold=None,
                ucg_schedule=None,
+               disable_prints=True,
+               plot=False,
+               plot_batch_idx=None,
+               save_dir=None,
                **kwargs
                ):
         if conditioning is not None:
@@ -99,7 +103,8 @@ class DDIMSampler(object):
         # sampling
         C, H, W = shape
         size = (batch_size, C, H, W)
-        print(f'Data shape for DDIM sampling is {size}, eta {eta}')
+        if not disable_prints and (self.model.args.accelerator is None or self.model.args.accelerator.is_main_process):
+            print(f'Data shape for DDIM sampling is {size}, eta {eta}')
 
         samples, intermediates = self.ddim_sampling(conditioning, size,
                                                     callback=callback,
@@ -116,7 +121,11 @@ class DDIMSampler(object):
                                                     unconditional_guidance_scale=unconditional_guidance_scale,
                                                     unconditional_conditioning=unconditional_conditioning,
                                                     dynamic_threshold=dynamic_threshold,
-                                                    ucg_schedule=ucg_schedule
+                                                    ucg_schedule=ucg_schedule,
+                                                    disable_prints=True,
+                                                    plot=plot,
+                                                    plot_batch_idx=plot_batch_idx,
+                                                    save_dir=save_dir
                                                     )
         return samples, intermediates
 
@@ -127,7 +136,7 @@ class DDIMSampler(object):
                       mask=None, x0=None, img_callback=None, log_every_t=100,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None, dynamic_threshold=None,
-                      ucg_schedule=None):
+                      ucg_schedule=None, disable_prints=True, plot=False, plot_batch_idx=None, save_dir=None):
         device = self.model.betas.device
         b = shape[0]
         if x_T is None:
@@ -144,9 +153,10 @@ class DDIMSampler(object):
         intermediates = {'x_inter': [img], 'pred_x0': [img]}
         time_range = reversed(range(0,timesteps)) if ddim_use_original_steps else np.flip(timesteps)
         total_steps = timesteps if ddim_use_original_steps else timesteps.shape[0]
-        print(f"Running DDIM Sampling with {total_steps} timesteps")
+        if not disable_prints:
+            print(f"Running DDIM Sampling with {total_steps} timesteps")
 
-        iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
+        iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps, disable=disable_prints)
 
         for i, step in enumerate(iterator):
             index = total_steps - i - 1
@@ -167,7 +177,9 @@ class DDIMSampler(object):
                                       corrector_kwargs=corrector_kwargs,
                                       unconditional_guidance_scale=unconditional_guidance_scale,
                                       unconditional_conditioning=unconditional_conditioning,
-                                      dynamic_threshold=dynamic_threshold)
+                                      dynamic_threshold=dynamic_threshold,
+                                      plot=plot, plot_batch_idx=plot_batch_idx, save_dir=save_dir
+                                      )
             img, pred_x0 = outs
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
@@ -182,7 +194,13 @@ class DDIMSampler(object):
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None,
-                      dynamic_threshold=None):
+                      dynamic_threshold=None, disable_prints=True, plot=False, plot_batch_idx=None, save_dir=None):
+        # plot every 10 timesteps, until last 10 steps where we plot every step
+        plot_timestep = True if (index < 10 or index % 10 == 9) else False
+
+        if plot and plot_timestep:
+            layer_hooks = None # TODO: need to register forward hooks
+        
         b, *_, device = *x.shape, x.device
 
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
@@ -249,6 +267,11 @@ class DDIMSampler(object):
         if noise_dropout > 0.:
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
+        
+        if plot and plot_timestep:
+            assert (self.model.args.accelerator is None or self.model.args.accelerator.is_main_process), "should only run from main process"
+            # plot activations
+
         return x_prev, pred_x0
 
     @torch.no_grad()

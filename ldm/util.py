@@ -8,6 +8,24 @@ from inspect import isfunction
 from PIL import Image, ImageDraw, ImageFont
 
 
+def str_or_int(arg):
+    try:
+        return int(arg)                           # try convert to int
+    except ValueError:
+        arg = str(arg)
+        if '.' in arg or '_' in arg:              # layer name (catch names with ',' or '-')
+            return arg
+        elif '-' in arg:                          # range of layer numbers            
+            assert len(arg.split('-')) == 2
+            start = int(arg.split('-')[0])
+            end = int(arg.split('-')[1]) + 1
+            return list(range(start, end))
+        elif ',' in arg:                          # csv of layer numbers
+            return [int(s) for s in arg.split(',')]
+        else:
+            return arg                            # layer name
+        
+        
 def autocast(f):
     def do_autocast(*args, **kwargs):
         with torch.cuda.amp.autocast(enabled=True,

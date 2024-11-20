@@ -834,6 +834,39 @@ class LatentDiffusion(DDPM):
         loss = self(x, c)
         return loss
 
+    # sample images for validation and testing
+    def sample_images(self, batch, batch_idx=None, epoch=None, save_dir=None, plot=False):
+        sampler = DDIMSampler(self)
+        
+        images, prompts = batch[self.first_stage_key], batch[self.cond_stage_key]
+        images = rearrange(images, 'b h w c -> b c h w')
+        images = torch.clamp((images + 1.0) / 2.0, min=0.0, max=1.0)
+        images = (images * 255).to(torch.uint8)
+        batch_size = images.shape[0]
+        shape = (self.channels, self.image_size, self.image_size)
+        
+        uc = self.get_learned_conditioning(batch_size * [""])
+        c = self.get_learned_conditioning(prompts)
+        samples, _ = sampler.sample(S=self.args.sample_steps,
+                                    conditioning=c,
+                                    batch_size=batch_size,
+                                    shape=shape,
+                                    verbose=False,
+                                    unconditional_guidance_scale=self.args.cfg_scale,
+                                    unconditional_conditioning=uc,
+                                    eta=0.0,
+                                    x_T=None, # no fixed code
+                                    disable_prints=True,
+                                    plot=plot,
+                                    plot_batch_idx=batch_idx,
+                                    save_dir=save_dir)
+
+        x_samples = self.decode_first_stage(samples)
+        x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+        x_samples = (x_samples * 255).to(torch.uint8)
+
+        return x_samples, images, prompts
+
     def forward(self, x, c, *args, **kwargs):
         t = torch.randint(0, self.num_timesteps, (x.shape[0],), device=self.device).long()
         if self.model.conditioning_key is not None:

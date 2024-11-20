@@ -70,7 +70,7 @@ data:
   target: main.DataModuleFromConfig
   params:
     batch_size: 3
-    num_workers: 4
+    num_workers: 1 # 4
     train:
       target: ldm.data.coco.CocoImagesAndCaptionsTrain2017
       params:

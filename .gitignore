@@ -3,5 +3,7 @@ __pycache__/
 
 checkpoints/
 outputs/
+data/coco/
+results/
 
 scripts/test.py
