@@ -46,6 +46,7 @@ parser.add_argument('--disable_xformers', action='store_true', help='disable xfo
 parser.add_argument('--plot', action='store_true', help='visualize model during evaluation loop')
 parser.add_argument('--plot_only', action='store_true', help='exit after generating the first plot')
 parser.add_argument("--plot_layer", default=None, type=str_or_int, help="when plotting, plot specified layers; provide layer number (e.g., 4), comma-separated list (e.g., 1,2,3,4), or a range (e.g., 1-4)")
+parser.add_argument("--plot_log", action='store_true', help="use log-scale when plotting")
 parser.add_argument("--save_images", action='store_true', help="save images during evaluation")
 parser.add_argument('--print_freq', default=50, type=int, help='print every k batches')
 parser.add_argument('--print_model', action='store_true', help='print model modules')
@@ -180,7 +181,7 @@ def evaluate_accuracy(model, dataloader=None, args=None):
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
             # check if we want to plot this batch
-            plot = False # args.plot and args.plot_inference and (args.no_cuda or (torch.cuda.is_available() and torch.cuda.current_device() == 0)) and (plot_schedule(args, epoch=epoch, i=i, training=False) if args.plot_schedule else i == args.plot_iteration)
+            plot = args.plot and (i < 20)
 
             batch[model.first_stage_key] = batch[model.first_stage_key].to(args.device)
             samples, images, prompts = model.sample_images(batch, batch_idx=i, epoch=None, save_dir=save_dir, plot=plot)
@@ -281,16 +282,20 @@ if __name__ == "__main__":
     #
     
     # load from checkpoint
-    if not os.path.isfile(args.checkpoint):
-        print("No checkpoint found!\n")
-        exit()
-    
-    print(f'\nLoading model from {args.checkpoint}\n')
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
-    model.load_state_dict(checkpoint["state_dict"], strict=False)
+    if args.checkpoint is None or not os.path.isfile(args.checkpoint):
+        print("\nNo checkpoint found! Proceeding without checkpoint.")
+    else:
+        print(f'\nLoading model from {args.checkpoint}\n')
+        checkpoint = torch.load(args.checkpoint, map_location="cpu")
+        model.load_state_dict(checkpoint["state_dict"], strict=False)
 
     if args.print_model:
-        print(model)
+        with open("layers.txt", 'w') as f:
+            layer_num = 0
+            for name, module in model.model.named_modules():
+                f.write(f"{layer_num}: {name}\n")
+                layer_num += 1
+        # print(model)
 
     args.experiment_str = get_experiment_str(args)
 

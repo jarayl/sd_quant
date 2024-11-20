@@ -5,7 +5,7 @@ import numpy as np
 from tqdm import tqdm
 
 from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like, extract_into_tensor
-
+from ldm.visualization import register_data_collector_hooks, plot_activations
 
 class DDIMSampler(object):
     def __init__(self, model, schedule="linear", device=torch.device("cuda"), **kwargs):
@@ -199,7 +199,7 @@ class DDIMSampler(object):
         plot_timestep = True if (index < 10 or index % 10 == 9) else False
 
         if plot and plot_timestep:
-            layer_hooks = None # TODO: need to register forward hooks
+            layer_hooks = register_data_collector_hooks(self.model.model, args=self.model.args) # TODO: need to register forward hooks
         
         b, *_, device = *x.shape, x.device
 
@@ -270,6 +270,7 @@ class DDIMSampler(object):
         
         if plot and plot_timestep:
             assert (self.model.args.accelerator is None or self.model.args.accelerator.is_main_process), "should only run from main process"
+            plot_activations(self.model.model, layer_hooks, i=plot_batch_idx, timestep=index, save_dir=save_dir, args=self.model.args)
             # plot activations
 
         return x_prev, pred_x0
