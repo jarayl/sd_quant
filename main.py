@@ -52,7 +52,8 @@ parser.add_argument('--print_freq', default=50, type=int, help='print every k ba
 parser.add_argument('--print_model', action='store_true', help='print model modules')
 parser.add_argument("--tag", default="", type=str, help="experiment identifier (string to prepend to save directory names")
 parser.add_argument('--activations', action='store_true', help='collect activation statistics')
-parser.add_argument('--vanilla_quantize', action='store_true', help='W8A8 vanilla quantization of model')
+parser.add_argument('--dynamic_quantize', action='store_true', help='dynamic quantization of model')
+parser.add_argument('--static_quantize', action='store_true', help='static quantization of model')
 parser.add_argument('--quantize_bitwidth', default=8, type=int, help='number of bits to quantize weights to (not activations)')
 
 
@@ -368,10 +369,13 @@ if __name__ == "__main__":
     #     args.test_dataloader_len = len(test_dataloader)
 
     # Apply quantization before moving the model to GPU
-    if args.vanilla_quantize:
-        print("Applying 8-bit quantization (W8A8) to the model's Linear and Conv2d layers...")
+    if args.dynamic_quantize:
+        print(f"Applying dynamic {args.quantize_bitwidth}-bit quantization (W{args.quantize_bitwidth}A8) to the model's Linear and Conv2d layers...")
         quantize_model_weights(model.model, num_bits=args.quantize_bitwidth)
         register_activation_quantization_hooks(model.model)
+    elif args.static_quantize:
+        print(f"Applying static {args.quantize_bitwidth}-bit quantization (W{args.quantize_bitwidth}A8) to the model's Linear and Conv2d layers...")
+
 
     model = model.to(args.device)
 
