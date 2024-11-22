@@ -51,7 +51,8 @@ parser.add_argument("--save_images", action='store_true', help="save images duri
 parser.add_argument('--print_freq', default=50, type=int, help='print every k batches')
 parser.add_argument('--print_model', action='store_true', help='print model modules')
 parser.add_argument("--tag", default="", type=str, help="experiment identifier (string to prepend to save directory names")
-        
+parser.add_argument('--activations', action='store_true', help='collect activation statistics')
+
 
 def get_experiment_str(args):
     experiment_str = args.tag + '_' + datetime.now().strftime('%Y-%m-%d_%H-%M/')
@@ -166,9 +167,10 @@ class DataModuleFromConfig(pl.LightningDataModule):
 
 
 def evaluate_accuracy(model, dataloader=None, args=None):
+    print (args.activations)
     model.eval()
     save_dir = f'./results/{args.experiment_str}/'
-
+    
     if args.monitor_fid:
         acc_metric = FrechetInceptionDistance().set_dtype(torch.float64).to(args.device)
     else:
@@ -182,13 +184,16 @@ def evaluate_accuracy(model, dataloader=None, args=None):
         for i, batch in enumerate(dataloader):
             # check if we want to plot this batch
             plot = args.plot and (i < 20)
-
+            activations = args.activations
+            
             batch[model.first_stage_key] = batch[model.first_stage_key].to(args.device)
-            samples, images, prompts = model.sample_images(batch, batch_idx=i, epoch=None, save_dir=save_dir, plot=plot)
+            samples, images, prompts = model.sample_images(batch, batch_idx=i, epoch=None, save_dir=save_dir, plot=plot, activations = activations)
 
             if plot and args.plot_only:
                 exit()
-
+            if activations:
+                exit()
+            
             # save the first 10 images, and then save one image every 100 iterations
             if args.evaluate and args.save_images and (args.accelerator is None or args.accelerator.is_main_process) and (i < 10 or i % 100 == 0):
                 filename = f"{i:05}.png"
