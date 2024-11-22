@@ -53,7 +53,7 @@ parser.add_argument('--print_model', action='store_true', help='print model modu
 parser.add_argument("--tag", default="", type=str, help="experiment identifier (string to prepend to save directory names")
 parser.add_argument('--activations', action='store_true', help='collect activation statistics')
 parser.add_argument('--vanilla_quantize', action='store_true', help='W8A8 vanilla quantization of model')
-parser.add_argument('--quantize_bitwidth', default=8, type=int, help='print every k batches')
+parser.add_argument('--quantize_bitwidth', default=8, type=int, help='number of bits to quantize weights to (not activations)')
 
 
 
