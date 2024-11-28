@@ -54,7 +54,10 @@ parser.add_argument("--tag", default="", type=str, help="experiment identifier (
 parser.add_argument('--activations', action='store_true', help='collect activation statistics')
 parser.add_argument('--dynamic_quantize', action='store_true', help='dynamic quantization of model')
 parser.add_argument('--static_quantize', action='store_true', help='static quantization of model')
-parser.add_argument('--quantize_bitwidth', default=8, type=int, help='number of bits to quantize weights to (not activations)')
+parser.add_argument('--weight_quantize_bitwidth', default=8, type=int, help='number of bits to quantize weights to (not activations)')
+parser.add_argument('--activation_quantize_bitwidth', default=8, type=int, help='number of bits to quantize activations to (not weights)')
+parser.add_argument('--rht_quant', action = 'store_true', help='Quantize with Random Hadamard Transform')
+
 
 
 
@@ -171,7 +174,6 @@ class DataModuleFromConfig(pl.LightningDataModule):
 
 
 def evaluate_accuracy(model, dataloader=None, args=None):
-    print (args.activations)
     model.eval()
     save_dir = f'./results/{args.experiment_str}/'
     
@@ -285,7 +287,7 @@ if __name__ == "__main__":
     
     train_dataloader, val_dataloader, test_dataloader = data._train_dataloader(), data._val_dataloader(), data._test_dataloader()
 
-    # ===== Weight Quantization =====
+    # ===== Standard Weight Quantization =====
 
     def quantize_weights(tensor, num_bits=8):
         qmin = -(2 ** (num_bits - 1))
@@ -312,9 +314,9 @@ if __name__ == "__main__":
                     if module.bias is not None:
                         module.bias.data = quantize_weights(module.bias.data, num_bits)
     
-    # ===== Dynamic Quantization Activation Functions =====
+    # ===== Standard Dynamic (Uniform) Quantization Activation Functions =====
 
-    def quantize_activation_dynamic(tensor, num_bits=8):
+    def quantize_activation_dynamic(tensor, num_bits):
         qmin = 0
         qmax = (2 ** num_bits) - 1
 
@@ -335,7 +337,7 @@ if __name__ == "__main__":
         return dq_x
 
     def activation_quantization_dynamic_hook(module, input, output):
-        return quantize_activation_dynamic(output, num_bits=8)
+        return quantize_activation_dynamic(output, num_bits=args.activation_quantize_bitwidth)
 
     def register_activation_quantization_dynamic_hooks(model):
         handles = []
@@ -426,9 +428,65 @@ if __name__ == "__main__":
         return activation_ranges
 
 
+    # def compute_quantization_parameters(activation_ranges, num_bits):
+    #     """
+    #     Compute quantization parameters using Power of Two scaling for each module
+        
+    #     Args:
+    #         activation_ranges (dict): Dictionary of min/max activation values for each module
+    #         num_bits (int): Number of quantization bits
+        
+    #     Returns:
+    #         dict: Quantization parameters for each module
+    #     """
+    #     quantization_params = {}
+    #     is_signed = False  # Power of Two typically uses unsigned quantization
+    #     qmin = 0
+    #     qmax = 2 ** num_bits - 1
+
+    #     for module_name, ranges in activation_ranges.items():
+    #         min_val = ranges['min']
+    #         max_val = ranges['max']
+            
+    #         # Determine if quantization needs to be symmetric (signed)
+    #         if is_signed:
+    #             # For signed quantization
+    #             act_range = max(abs(min_val), abs(max_val))
+    #             scale = act_range / (qmax / 2)
+    #             # Adjust to power of two
+    #             scale = 2 ** np.floor(np.log2(scale + 1e-8))
+    #             zero_point = 0  # symmetric quantization has zero_point at 0
+    #         else:
+    #             # For unsigned quantization
+    #             # Ensure non-negative range
+    #             min_val = min(0, min_val)
+    #             max_val = max(0, max_val)
+                
+    #             # Compute scale as power of two
+    #             act_range = max_val - min_val
+    #             if act_range == 0:
+    #                 scale = 1.0
+    #                 zero_point = 0
+    #             else:
+    #                 scale = act_range / qmax
+    #                 # Round to next power of two
+    #                 scale = 2 ** np.ceil(np.log2(scale + 1e-8))
+                    
+    #                 # Compute zero point
+    #                 zero_point = qmin - min_val / scale
+    #                 zero_point = np.clip(zero_point, qmin, qmax)
+
+    #         quantization_params[module_name] = {
+    #             'scale': float(scale),
+    #             'zero_point': int(zero_point),
+    #             'qmin': qmin,
+    #             'qmax': qmax
+    #         }
+        
+    #     return quantization_params
     def compute_quantization_parameters(activation_ranges, num_bits):
         """
-        Compute quantization parameters using Power of Two scaling for each module
+        Compute quantization parameters using standard uniform quantization for each module
         
         Args:
             activation_ranges (dict): Dictionary of min/max activation values for each module
@@ -438,7 +496,6 @@ if __name__ == "__main__":
             dict: Quantization parameters for each module
         """
         quantization_params = {}
-        is_signed = False  # Power of Two typically uses unsigned quantization
         qmin = 0
         qmax = 2 ** num_bits - 1
 
@@ -446,33 +503,20 @@ if __name__ == "__main__":
             min_val = ranges['min']
             max_val = ranges['max']
             
-            # Determine if quantization needs to be symmetric (signed)
-            if is_signed:
-                # For signed quantization
-                act_range = max(abs(min_val), abs(max_val))
-                scale = act_range / (qmax / 2)
-                # Adjust to power of two
-                scale = 2 ** np.floor(np.log2(scale + 1e-8))
-                zero_point = 0  # symmetric quantization has zero_point at 0
+            # For unsigned quantization
+            # Ensure non-negative range
+            # min_val = min(0, min_val)
+            # max_val = max(0, max_val)
+            
+            # Compute scale
+            act_range = max_val - min_val
+            if act_range == 0:
+                scale = 1.0
+                zero_point = 0
             else:
-                # For unsigned quantization
-                # Ensure non-negative range
-                min_val = min(0, min_val)
-                max_val = max(0, max_val)
-                
-                # Compute scale as power of two
-                act_range = max_val - min_val
-                if act_range == 0:
-                    scale = 1.0
-                    zero_point = 0
-                else:
-                    scale = act_range / qmax
-                    # Round to next power of two
-                    scale = 2 ** np.ceil(np.log2(scale + 1e-8))
-                    
-                    # Compute zero point
-                    zero_point = qmin - min_val / scale
-                    zero_point = np.clip(zero_point, qmin, qmax)
+                scale = act_range / (qmax - qmin)
+                zero_point = qmin - min_val / scale
+                zero_point = np.clip(zero_point, qmin, qmax)
 
             quantization_params[module_name] = {
                 'scale': float(scale),
@@ -540,6 +584,96 @@ if __name__ == "__main__":
         
         return handles
 
+    # ===== Random Hadamard Transform Functions =====
+
+    def generate_random_sign_vector(length, device, dtype):
+        """Generate a random sign vector (+1 or -1) of given length."""
+        return torch.randint(0, 2, (length,), device=device, dtype=dtype) * 2 - 1  # Random +/-1
+
+    def fwht(x):
+        """In-place Fast Walsh-Hadamard Transform of vector x."""
+        N = x.shape[0]
+        h = 1
+        while h < N:
+            # Perform butterfly operations
+            for i in range(0, N, h * 2):
+                a = x[i:i + h]
+                b = x[i + h:i + 2 * h]
+                x[i:i + h] = a + b
+                x[i + h:i + 2 * h] = a - b
+            h *= 2
+        return x
+
+    def apply_random_hadamard_transform(tensor):
+        """Apply random sign flipping and FWHT to the tensor."""
+        original_shape = tensor.shape
+        tensor = tensor.flatten()
+        length = tensor.numel()
+        # Ensure length is a power of two
+        n = 2 ** int(np.ceil(np.log2(length)))
+        pad_length = n - length
+        if pad_length > 0:
+            tensor = torch.cat([tensor, torch.zeros(pad_length, device=tensor.device, dtype=tensor.dtype)])
+        # Random sign flipping
+        sign_vector = generate_random_sign_vector(n, tensor.device, tensor.dtype)
+        tensor = tensor * sign_vector
+        # Apply FWHT
+        tensor = fwht(tensor)
+        return tensor, sign_vector, original_shape, pad_length
+
+    def reverse_random_hadamard_transform(tensor, sign_vector, original_shape, pad_length):
+        """Reverse the FWHT and random sign flipping."""
+        # Apply FWHT (inverse of FWHT is itself)
+        tensor = fwht(tensor)
+        # Reverse sign flipping
+        tensor = tensor * sign_vector
+        # Remove padding if any
+        if pad_length > 0:
+            tensor = tensor[:-pad_length]
+        tensor = tensor.view(original_shape)
+        return tensor
+    
+    # ===== Weight Quantization with Random Hadamard Transform =====
+
+    def RHT_quantize_model_weights(model, num_bits=8):
+        for name, module in model.named_modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                with torch.no_grad():
+                    # Flatten weight tensor
+                    weight = module.weight.data
+                    transformed_weight, sign_vector, original_shape, pad_length = apply_random_hadamard_transform(weight)
+                    # Quantize transformed weights
+                    quantized_weight = quantize_weights(transformed_weight, num_bits)
+                    # Reverse Hadamard transform
+                    recovered_weight = reverse_random_hadamard_transform(quantized_weight, sign_vector, original_shape, pad_length)
+                    module.weight.data.copy_(recovered_weight.view(original_shape))
+                    if module.bias is not None:
+                        # Quantize biases normally (or apply similar transform if desired)
+                        module.bias.data.copy_(quantize_weights(module.bias.data, num_bits))
+
+    # ===== Dynamic Activation Quantization with Random Hadamard Transform =====
+
+    def RHT_activation_quantization_dynamic_hook(module, input, output):
+        if not isinstance(output, torch.Tensor):
+            return output
+        with torch.no_grad():
+            # Flatten output tensor
+            output_flat = output.view(-1)
+            transformed_output, sign_vector, original_shape, pad_length = apply_random_hadamard_transform(output_flat)
+            # Quantize transformed activations
+            quantized_output = quantize_activation_dynamic(transformed_output, num_bits=args.activation_quantize_bitwidth)
+            # Reverse Hadamard transform
+            recovered_output = reverse_random_hadamard_transform(quantized_output, sign_vector, original_shape, pad_length)
+            return recovered_output.view(output.shape)
+
+    def RHT_register_activation_quantization_dynamic_hooks(model):
+        handles = []
+        for name, module in model.named_modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                handle = module.register_forward_hook(RHT_activation_quantization_dynamic_hook)
+                handles.append(handle)
+        return handles
+
     # load from checkpoint
     if args.checkpoint is None or not os.path.isfile(args.checkpoint):
         print("\nNo checkpoint found! Proceeding without checkpoint.")
@@ -569,26 +703,35 @@ if __name__ == "__main__":
 
     # Apply quantization before moving the model to GPU
     if args.dynamic_quantize:
-        print(f"Applying dynamic {args.quantize_bitwidth}-bit quantization (W{args.quantize_bitwidth}A8) to the model's Linear and Conv2d layers...")
-        quantize_model_weights(model.model, num_bits=args.quantize_bitwidth)
+        print(f"Applying dynamic  quantization (W{args.weight_quantize_bitwidth}A{args.activation_quantize_bitwidth}) to the model's Linear and Conv2d layers...")
+        quantize_model_weights(model.model, num_bits=args.weight_quantize_bitwidth)
         activation_quantization_handles = register_activation_quantization_dynamic_hooks(model.model)
 
         model = model.to(args.device)
         
     elif args.static_quantize:
         model = model.to(args.device)
-
-        print(f"Applying static {args.quantize_bitwidth}-bit quantization (W{args.quantize_bitwidth}A8) to the model's Linear and Conv2d layers...")
-        quantize_model_weights(model.model, num_bits=args.quantize_bitwidth)
+        
+        print(f"Applying static quantization (W{args.weight_quantize_bitwidth}A{args.activation_quantize_bitwidth}) to the model's Linear and Conv2d layers...")
+        quantize_model_weights(model.model, num_bits=args.weight_quantize_bitwidth)
         # Collect activation ranges
         num_calibration_batches = 10
         activation_ranges = collect_activation_ranges(model, train_dataloader, num_calibration_batches, args)
 
         # Compute quantization parameters
-        quantization_params = compute_quantization_parameters(activation_ranges, args.quantize_bitwidth)
+        quantization_params = compute_quantization_parameters(activation_ranges, args.activation_quantize_bitwidth)
 
         # Register static quantization hooks
         activation_quantization_handles = register_activation_quantization_static_hooks(model, quantization_params)
+
+    elif args.rht_quant:
+        print(f"Applying dynamic quantization with Random Hadamard Transform (W{args.weight_quantize_bitwidth}A{args.activation_quantize_bitwidth}) to the model's Linear and Conv2d layers...")
+        print("Quantizing Weights Now")
+        RHT_quantize_model_weights(model.model, num_bits=args.weight_quantize_bitwidth)
+        print("Quantizing activation hooks")
+        activation_quantization_handles = RHT_register_activation_quantization_dynamic_hooks(model.model)
+
+        model = model.to(args.device)
     else:
         model = model.to(args.device)
     
