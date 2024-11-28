@@ -26,7 +26,7 @@ from ldm.data.coco import CocoImagesAndCaptionsTrain2017, CocoImagesAndCaptionsV
 from ldm.util import instantiate_from_config, str_or_int
 from ldm.eval.clip_score import CLIPScore
 from ldm.eval.fid_score import FrechetInceptionDistance
-        
+
 
 parser = argparse.ArgumentParser()
 
@@ -285,9 +285,9 @@ if __name__ == "__main__":
     
     train_dataloader, val_dataloader, test_dataloader = data._train_dataloader(), data._val_dataloader(), data._test_dataloader()
 
-    # TODO: quantization
+    # ===== Weight Quantization =====
 
-    def quantize_weight(tensor, num_bits=8):
+    def quantize_weights(tensor, num_bits=8):
         qmin = -(2 ** (num_bits - 1))
         qmax = (2 ** (num_bits - 1)) - 1
 
@@ -308,11 +308,13 @@ if __name__ == "__main__":
         for name, module in model.named_modules():
             if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
                 with torch.no_grad():
-                    module.weight.data = quantize_weight(module.weight.data, num_bits)
+                    module.weight.data = quantize_weights(module.weight.data, num_bits)
                     if module.bias is not None:
-                        module.bias.data = quantize_weight(module.bias.data, num_bits)
+                        module.bias.data = quantize_weights(module.bias.data, num_bits)
+    
+    # ===== Dynamic Quantization Activation Functions =====
 
-    def quantize_activation(tensor, num_bits=8):
+    def quantize_activation_dynamic(tensor, num_bits=8):
         qmin = 0
         qmax = (2 ** num_bits) - 1
 
@@ -332,15 +334,212 @@ if __name__ == "__main__":
 
         return dq_x
 
-    def activation_quantization_hook(module, input, output):
-        return quantize_activation(output, num_bits=8)
+    def activation_quantization_dynamic_hook(module, input, output):
+        return quantize_activation_dynamic(output, num_bits=8)
 
-    def register_activation_quantization_hooks(model):
+    def register_activation_quantization_dynamic_hooks(model):
+        handles = []
         for name, module in model.named_modules():
             if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-                module.register_forward_hook(activation_quantization_hook)
+                handle = module.register_forward_hook(activation_quantization_dynamic_hook)
+                handles.append(handle)
+        return handles
 
-    
+    # ===== Static Quantization Activation Functions =====
+
+    def collect_activation_ranges(model, dataloader, num_batches, args):
+        activation_ranges = {}
+        module_to_name = {}
+        handles = []
+
+        # Build module_to_name mapping
+        for name, module in model.named_modules():
+            module_to_name[module] = name
+
+        # Define hook to collect activation ranges
+        def collect_activation_ranges_hook(module, input, output):
+            module_name = module_to_name[module]
+            
+            # Handle tensor output
+            if isinstance(output, torch.Tensor):
+                min_val = output.min().item()
+                max_val = output.max().item()
+                if module_name not in activation_ranges:
+                    activation_ranges[module_name] = {'min': min_val, 'max': max_val}
+                else:
+                    activation_ranges[module_name]['min'] = min(activation_ranges[module_name]['min'], min_val)
+                    activation_ranges[module_name]['max'] = max(activation_ranges[module_name]['max'], max_val)
+
+        # Register hooks
+        for name, module in model.named_modules():
+            if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
+                handle = module.register_forward_hook(collect_activation_ranges_hook)
+                handles.append(handle)
+
+        # Run calibration
+        model.eval()
+        with torch.no_grad():
+            for i, batch in enumerate(dataloader):
+                if i >= num_batches:
+                    break
+                
+                try:
+                    # Get x_start and ensure it's in NCHW format
+                    x_start = batch[model.first_stage_key].to(args.device)
+                    if x_start.ndim == 4 and x_start.shape[1] != 3 and x_start.shape[3] == 3:
+                        # Convert from NHWC to NCHW
+                        x_start = x_start.permute(0, 3, 1, 2)
+                    elif x_start.ndim == 3 and x_start.shape[2] == 3:
+                        # Handle case where batch dimension is missing
+                        x_start = x_start.permute(2, 0, 1).unsqueeze(0)
+                    elif x_start.ndim != 4:
+                        print(f"Unexpected x_start shape: {x_start.shape}")
+                        continue
+
+                    # Encode x_start
+                    x_start = model.get_first_stage_encoding(model.encode_first_stage(x_start))
+
+                    # Prepare conditioning
+                    prompts = batch['caption']
+                    conditioning = model.get_learned_conditioning(prompts)
+                    
+                    # Generate noise
+                    noise = torch.randn_like(x_start)
+                    
+                    # Get timesteps
+                    t = torch.randint(0, model.num_timesteps, (x_start.shape[0],), device=args.device).long()
+                    
+                    # Add noise to x_start to get x_noisy
+                    x_noisy = model.q_sample(x_start=x_start, t=t, noise=noise)
+                    
+                    # Apply model to get noise_pred
+                    noise_pred = model.apply_model(x_noisy, t, conditioning)
+                    
+                except Exception as e:
+                    print(f"Error processing batch {i}: {e}")
+                    continue
+
+        # Remove hooks
+        for handle in handles:
+            handle.remove()
+
+        return activation_ranges
+
+
+    def compute_quantization_parameters(activation_ranges, num_bits):
+        """
+        Compute quantization parameters using Power of Two scaling for each module
+        
+        Args:
+            activation_ranges (dict): Dictionary of min/max activation values for each module
+            num_bits (int): Number of quantization bits
+        
+        Returns:
+            dict: Quantization parameters for each module
+        """
+        quantization_params = {}
+        is_signed = False  # Power of Two typically uses unsigned quantization
+        qmin = 0
+        qmax = 2 ** num_bits - 1
+
+        for module_name, ranges in activation_ranges.items():
+            min_val = ranges['min']
+            max_val = ranges['max']
+            
+            # Determine if quantization needs to be symmetric (signed)
+            if is_signed:
+                # For signed quantization
+                act_range = max(abs(min_val), abs(max_val))
+                scale = act_range / (qmax / 2)
+                # Adjust to power of two
+                scale = 2 ** np.floor(np.log2(scale + 1e-8))
+                zero_point = 0  # symmetric quantization has zero_point at 0
+            else:
+                # For unsigned quantization
+                # Ensure non-negative range
+                min_val = min(0, min_val)
+                max_val = max(0, max_val)
+                
+                # Compute scale as power of two
+                act_range = max_val - min_val
+                if act_range == 0:
+                    scale = 1.0
+                    zero_point = 0
+                else:
+                    scale = act_range / qmax
+                    # Round to next power of two
+                    scale = 2 ** np.ceil(np.log2(scale + 1e-8))
+                    
+                    # Compute zero point
+                    zero_point = qmin - min_val / scale
+                    zero_point = np.clip(zero_point, qmin, qmax)
+
+            quantization_params[module_name] = {
+                'scale': float(scale),
+                'zero_point': int(zero_point),
+                'qmin': qmin,
+                'qmax': qmax
+            }
+        
+        return quantization_params
+
+    def register_activation_quantization_static_hooks(model, quantization_params):
+        """
+        Register static activation quantization hooks for model modules
+        
+        Args:
+            model (torch.nn.Module): Model to quantize
+            quantization_params (dict): Precomputed quantization parameters
+        
+        Returns:
+            list: Handles to registered hooks
+        """
+        module_to_name = {}
+        handles = []
+
+        # Build module_to_name mapping
+        for name, module in model.named_modules():
+            module_to_name[module] = name
+
+        # Define hook for static activation quantization
+        def activation_quantization_static_hook(module, input, output):
+            module_name = module_to_name[module]
+            
+            # Retrieve quantization parameters
+            params = quantization_params.get(module_name, None)
+            if params is None:
+                return output
+            
+            scale = params['scale']
+            zero_point = params['zero_point']
+            qmin = params['qmin']
+            qmax = params['qmax']
+            
+            # Ensure output is a tensor
+            if not isinstance(output, torch.Tensor):
+                return output
+            
+            # Power of Two Quantization Process
+            try:
+                # Quantize: scale, shift, round, and clamp
+                q_x = ((output / scale) + zero_point).round().clamp(qmin, qmax)
+                
+                # Dequantize: shift back and rescale
+                dq_x = (q_x - zero_point) * scale
+                
+                return dq_x
+            except Exception as e:
+                print(f"Quantization error for module {module_name}: {e}")
+                return output
+
+        # Register hooks for specific layer types
+        for name, module in model.named_modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d, torch.nn.Conv1d)):
+                handle = module.register_forward_hook(activation_quantization_static_hook)
+                handles.append(handle)
+        
+        return handles
+
     # load from checkpoint
     if args.checkpoint is None or not os.path.isfile(args.checkpoint):
         print("\nNo checkpoint found! Proceeding without checkpoint.")
@@ -372,13 +571,27 @@ if __name__ == "__main__":
     if args.dynamic_quantize:
         print(f"Applying dynamic {args.quantize_bitwidth}-bit quantization (W{args.quantize_bitwidth}A8) to the model's Linear and Conv2d layers...")
         quantize_model_weights(model.model, num_bits=args.quantize_bitwidth)
-        register_activation_quantization_hooks(model.model)
+        activation_quantization_handles = register_activation_quantization_dynamic_hooks(model.model)
+
+        model = model.to(args.device)
+        
     elif args.static_quantize:
+        model = model.to(args.device)
+
         print(f"Applying static {args.quantize_bitwidth}-bit quantization (W{args.quantize_bitwidth}A8) to the model's Linear and Conv2d layers...")
+        quantize_model_weights(model.model, num_bits=args.quantize_bitwidth)
+        # Collect activation ranges
+        num_calibration_batches = 10
+        activation_ranges = collect_activation_ranges(model, train_dataloader, num_calibration_batches, args)
 
+        # Compute quantization parameters
+        quantization_params = compute_quantization_parameters(activation_ranges, args.quantize_bitwidth)
 
-    model = model.to(args.device)
-
+        # Register static quantization hooks
+        activation_quantization_handles = register_activation_quantization_static_hooks(model, quantization_params)
+    else:
+        model = model.to(args.device)
+    
     if args.evaluate:
         iter_str = f' for {args.eval_samples} samples' if args.eval_samples is not None else ''
         print(f'\n\n\nEvaluating model on COCO validation dataset{iter_str}\n\n')
