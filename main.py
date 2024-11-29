@@ -20,13 +20,13 @@ import torch.backends.cudnn as cudnn
 import torchvision
 from torch.utils.tensorboard import SummaryWriter
 import pytorch_lightning as pl
+import torch.nn.functional as F
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.data.coco import CocoImagesAndCaptionsTrain2017, CocoImagesAndCaptionsValidation2017
 from ldm.util import instantiate_from_config, str_or_int
 from ldm.eval.clip_score import CLIPScore
 from ldm.eval.fid_score import FrechetInceptionDistance
-
 
 parser = argparse.ArgumentParser()
 
@@ -56,15 +56,11 @@ parser.add_argument('--dynamic_quantize', action='store_true', help='dynamic qua
 parser.add_argument('--static_quantize', action='store_true', help='static quantization of model')
 parser.add_argument('--weight_quantize_bitwidth', default=8, type=int, help='number of bits to quantize weights to (not activations)')
 parser.add_argument('--activation_quantize_bitwidth', default=8, type=int, help='number of bits to quantize activations to (not weights)')
-parser.add_argument('--rht_quant', action = 'store_true', help='Quantize with Random Hadamard Transform')
-
-
-
+parser.add_argument('--rht_quant', action='store_true', help='Quantize with Random Hadamard Transform')
 
 def get_experiment_str(args):
     experiment_str = args.tag + '_' + datetime.now().strftime('%Y-%m-%d_%H-%M/')
     return experiment_str
-
 
 class WrappedDataset(Dataset):
     """Wraps an arbitrary object with __len__ and __getitem__ into a pytorch dataset"""
@@ -77,7 +73,6 @@ class WrappedDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.data[idx]
-
 
 def worker_init_fn(_):
     worker_info = torch.utils.data.get_worker_info()
@@ -93,7 +88,6 @@ def worker_init_fn(_):
         return np.random.seed(np.random.get_state()[1][current_id] + worker_id)
     else:
         return np.random.seed(np.random.get_state()[1][0] + worker_id)
-
 
 class DataModuleFromConfig(pl.LightningDataModule):
     def __init__(self, batch_size, train=None, validation=None, test=None, predict=None,
@@ -172,7 +166,6 @@ class DataModuleFromConfig(pl.LightningDataModule):
         return DataLoader(self.datasets["predict"], batch_size=self.batch_size,
                           num_workers=self.num_workers, worker_init_fn=init_fn)
 
-
 def evaluate_accuracy(model, dataloader=None, args=None):
     model.eval()
     save_dir = f'./results/{args.experiment_str}/'
@@ -188,6 +181,7 @@ def evaluate_accuracy(model, dataloader=None, args=None):
 
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
+            print(f"batch {i} \n")
             # check if we want to plot this batch
             plot = args.plot and (i < 20)
             activations = args.activations
@@ -222,6 +216,375 @@ def evaluate_accuracy(model, dataloader=None, args=None):
     
     return test_acc
 
+# ===== Main Quantization Functions =====
+
+def quantize_weights(model, args):
+    if args.rht_quant:
+        print(f"Applying RHT quantization (W{args.weight_quantize_bitwidth}A{args.activation_quantize_bitwidth} bits) to the model's Linear layers...")
+        replace_linear_with_rht_quantized_linear(model, args.weight_quantize_bitwidth, args.activation_quantize_bitwidth)
+        for name, module in model.named_modules():
+            if isinstance(module, RHTQuantizedLinear):
+                module.quantize_weight()
+    else:
+        print(f"Applying {'dynamic' if args.dynamic_quantize else 'static'} quantization (W{args.weight_quantize_bitwidth} bits) to the model's Linear and Conv2d layers...")
+        for name, module in model.named_modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                with torch.no_grad():
+                    # Quantize and dequantize weights
+                    deq_w = quantize_tensor_min_max(module.weight.data, args.weight_quantize_bitwidth, signed=True)
+                    module.weight.data.copy_(deq_w)
+
+                    # Quantize and dequantize bias if present
+                    if module.bias is not None:
+                        deq_b = quantize_tensor_min_max(module.bias.data, args.weight_quantize_bitwidth, signed=True)
+                        module.bias.data.copy_(deq_b)
+                        
+def quantize_activations(model, args, activation_ranges=None):
+    """
+    Main activation quantization function that handles different quantization modes.
+    """
+    if args.rht_quant:
+        # For RHT quantization, activations are quantized within the RHTQuantizedLinear class
+        pass
+    else:
+        if args.dynamic_quantize:
+            print(f"Applying dynamic activation quantization (A{args.activation_quantize_bitwidth} bits)...")
+            register_activation_quantization_hooks(model, args, activation_ranges=None)
+        elif args.static_quantize:
+            print(f"Applying static activation quantization (A{args.activation_quantize_bitwidth} bits)...")
+            if activation_ranges is None:
+                raise ValueError("Activation ranges must be provided for static quantization.")
+            register_activation_quantization_hooks(model, args, activation_ranges)
+        else:
+            pass  # No activation quantization
+
+# ===== Helper Functions =====
+
+def quantize_tensor_min_max(tensor, num_bits=8, signed=True):
+    """
+    Quantizes a tensor using standard min-max uniform quantization,
+    then immediately dequantizes it back to floating-point format.
+    """
+    if signed:
+        qmin = -(2 ** (num_bits - 1))
+        qmax = (2 ** (num_bits - 1)) - 1
+    else:
+        qmin = 0
+        qmax = (2 ** num_bits) - 1
+
+    min_val = tensor.min()
+    max_val = tensor.max()
+    if min_val == max_val:
+        scale = 1.0
+        zero_point = 0
+        q_x = torch.zeros_like(tensor)
+    else:
+        scale = (max_val - min_val) / (qmax - qmin)
+        zero_point = qmin - min_val / scale
+
+        # Quantize
+        q_x = ((tensor / scale) + zero_point).round().clamp(qmin, qmax)
+
+    # Dequantize
+    deq_x = (q_x - zero_point) * scale
+
+    return deq_x
+
+def quantize_and_dequantize_tensor(tensor, scale, zero_point, qmin, qmax):
+    """
+    Quantizes and immediately dequantizes a tensor using provided scale and zero_point.
+    """
+    q_x = ((tensor / scale) + zero_point).round().clamp(qmin, qmax)
+    deq_x = (q_x - zero_point) * scale
+    return deq_x
+
+def register_activation_quantization_hooks(model, args, activation_ranges=None):
+    """
+    Register activation quantization hooks for dynamic or static quantization.
+    """
+    module_to_name = {}
+    handles = []
+
+    # Build module_to_name mapping
+    for name, module in model.named_modules():
+        module_to_name[module] = name
+
+    # Define hook for activation quantization
+    def activation_quantization_hook(module, input, output):
+        module_name = module_to_name[module]
+
+        if args.dynamic_quantize:
+            deq_x = quantize_tensor_min_max(output, num_bits=args.activation_quantize_bitwidth, signed=False)
+            return deq_x
+        elif args.static_quantize:
+            # Retrieve quantization parameters
+            params = activation_ranges.get(module_name, None)
+            if params is None:
+                return output
+
+            scale = params['scale']
+            zero_point = params['zero_point']
+            qmin = params['qmin']
+            qmax = params['qmax']
+
+            deq_x = quantize_and_dequantize_tensor(output, scale, zero_point, qmin, qmax)
+            return deq_x
+        else:
+            return output
+
+    # Register hooks for specific layer types
+    for name, module in model.named_modules():
+        if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+            handle = module.register_forward_hook(activation_quantization_hook)
+            handles.append(handle)
+
+    return handles
+
+def collect_activation_ranges(model, dataloader, num_batches, args):
+    activation_ranges = {}
+    module_to_name = {}
+    handles = []
+
+    # Build module_to_name mapping
+    for name, module in model.named_modules():
+        module_to_name[module] = name
+
+    # Define hook to collect activation ranges
+    def collect_activation_ranges_hook(module, input, output):
+        module_name = module_to_name[module]
+        
+        # Handle tensor output
+        if isinstance(output, torch.Tensor):
+            min_val = output.min().item()
+            max_val = output.max().item()
+            if module_name not in activation_ranges:
+                activation_ranges[module_name] = {'min': min_val, 'max': max_val}
+            else:
+                activation_ranges[module_name]['min'] = min(activation_ranges[module_name]['min'], min_val)
+                activation_ranges[module_name]['max'] = max(activation_ranges[module_name]['max'], max_val)
+
+    # Register hooks
+    for name, module in model.named_modules():
+        if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
+            handle = module.register_forward_hook(collect_activation_ranges_hook)
+            handles.append(handle)
+
+    # Run calibration
+    model.eval()
+    with torch.no_grad():
+        for i, batch in enumerate(dataloader):
+            if i >= num_batches:
+                break
+            
+            try:
+                # Get x_start and ensure it's in NCHW format
+                x_start = batch[model.first_stage_key].to(args.device)
+                if x_start.ndim == 4 and x_start.shape[1] != 3 and x_start.shape[3] == 3:
+                    # Convert from NHWC to NCHW
+                    x_start = x_start.permute(0, 3, 1, 2)
+                elif x_start.ndim == 3 and x_start.shape[2] == 3:
+                    # Handle case where batch dimension is missing
+                    x_start = x_start.permute(2, 0, 1).unsqueeze(0)
+                elif x_start.ndim != 4:
+                    print(f"Unexpected x_start shape: {x_start.shape}")
+                    continue
+
+                # Encode x_start
+                x_start = model.get_first_stage_encoding(model.encode_first_stage(x_start))
+
+                # Prepare conditioning
+                prompts = batch['caption']
+                conditioning = model.get_learned_conditioning(prompts)
+                
+                # Generate noise
+                noise = torch.randn_like(x_start)
+                
+                # Get timesteps
+                t = torch.randint(0, model.num_timesteps, (x_start.shape[0],), device=args.device).long()
+                
+                # Add noise to x_start to get x_noisy
+                x_noisy = model.q_sample(x_start=x_start, t=t, noise=noise)
+                
+                # Apply model to get noise_pred
+                noise_pred = model.apply_model(x_noisy, t, conditioning)
+                
+            except Exception as e:
+                print(f"Error processing batch {i}: {e}")
+                continue
+
+    # Remove hooks
+    for handle in handles:
+        handle.remove()
+
+    return activation_ranges
+
+def compute_quantization_parameters(activation_ranges, num_bits):
+    """
+    Compute quantization parameters using standard uniform quantization for each module
+    """
+    quantization_params = {}
+    qmin = 0
+    qmax = 2 ** num_bits - 1
+
+    for module_name, ranges in activation_ranges.items():
+        min_val = ranges['min']
+        max_val = ranges['max']
+        
+        # Compute scale
+        act_range = max_val - min_val
+        if act_range == 0:
+            scale = 1.0
+            zero_point = 0
+        else:
+            scale = act_range / (qmax - qmin)
+            zero_point = qmin - min_val / scale
+            zero_point = np.clip(zero_point, qmin, qmax)
+
+        quantization_params[module_name] = {
+            'scale': float(scale),
+            'zero_point': int(zero_point),
+            'qmin': qmin,
+            'qmax': qmax
+        }
+    
+    return quantization_params
+
+# ===== Random Hadamard Transform Functions =====
+
+def generate_random_sign_vector(length, device, dtype):
+    """Generate a random sign vector (+1 or -1) of given length."""
+    return torch.randint(0, 2, (length,), device=device, dtype=dtype) * 2 - 1  # Random +/-1
+
+def fwht(x):
+    """Fast Walsh-Hadamard Transform along the last dimension."""
+    orig_shape = x.shape
+    N = x.shape[-1]
+    if (N & (N - 1)) != 0:
+        # Pad to next power of two
+        N_padded = 2 ** int(np.ceil(np.log2(N)))
+        pad_size = N_padded - N
+        x = F.pad(x, (0, pad_size))
+    else:
+        N_padded = N
+        pad_size = 0
+
+    x = x.reshape(-1, N_padded)
+    h = 1
+    while h < N_padded:
+        for i in range(0, N_padded, h * 2):
+            a = x[:, i:i + h]
+            b = x[:, i + h:i + 2 * h]
+            x[:, i:i + h] = a + b
+            x[:, i + h:i + 2 * h] = a - b
+        h *= 2
+
+    x = x.reshape(*orig_shape[:-1], N_padded)
+
+    if pad_size > 0:
+        x = x[..., :N]
+
+    return x
+
+
+class RHTQuantizedLinear(torch.nn.Linear):
+    def __init__(self, in_features, out_features, bias=True, weight_bits = 8, activation_bits=8):
+        super(RHTQuantizedLinear, self).__init__(in_features, out_features, bias)
+        self.weight_bits = weight_bits
+        self.activation_bits = activation_bits
+        self.register_buffer('sign_vector', None)
+
+    def quantize_weight(self):
+        with torch.no_grad():
+            # Generate random sign vector
+            self.sign_vector = generate_random_sign_vector(self.in_features, self.weight.device, self.weight.dtype)
+            N = self.in_features
+            weight = self.weight.data
+
+            # Pad weight if necessary
+            if (N & (N - 1)) != 0:
+                N_padded = 2 ** int(np.ceil(np.log2(N)))
+                pad_size = N_padded - N
+                weight = F.pad(weight, (0, pad_size))
+                sign_vector = F.pad(self.sign_vector, (0, pad_size), value=1)
+            else:
+                pad_size = 0
+                sign_vector = self.sign_vector
+
+            # Apply sign flipping and Hadamard transform to weights
+            weight = weight * sign_vector.unsqueeze(0)
+            weight = fwht(weight)
+
+            # Quantize and dequantize transformed weights
+            deq_w = quantize_tensor_min_max(weight, self.weight_bits, signed=True)
+
+            # Remove padding if necessary
+            if pad_size > 0:
+                deq_w = deq_w[:, :N]
+
+            # Assign dequantized weights back to self.weight.data
+            self.weight.data.copy_(deq_w)
+
+            # Quantize and dequantize bias if present
+            if self.bias is not None:
+                deq_b = quantize_tensor_min_max(self.bias.data, self.weight_bits, signed=True)
+                self.bias.data.copy_(deq_b)
+
+    def forward(self, input):
+        if self.sign_vector is None:
+            raise ValueError("Weights not quantized. Call quantize_weight() before inference.")
+
+        N = self.in_features
+        orig_shape = input.shape
+        last_dim = input.shape[-1]
+
+        if last_dim != N:
+            raise ValueError(f"Input has last dimension {last_dim}, expected {N}")
+
+        x = input
+
+        # Pad input if necessary
+        if (N & (N - 1)) != 0:
+            N_padded = 2 ** int(np.ceil(np.log2(N)))
+            pad_size = N_padded - N
+            x = F.pad(x, (0, pad_size))
+            sign_vector = F.pad(self.sign_vector, (0, pad_size), value=1)
+        else:
+            pad_size = 0
+            sign_vector = self.sign_vector
+
+        # Apply sign flipping and Hadamard transform to input
+        x = x * sign_vector
+        x = fwht(x)
+
+        # Quantize and dequantize input
+        deq_x = quantize_tensor_min_max(x, num_bits=self.activation_bits, signed=False)
+
+        # Remove padding if necessary
+        if pad_size > 0:
+            deq_x = deq_x[..., :N]
+
+        # Perform linear operation using dequantized weights and inputs
+        output = F.linear(deq_x.view(-1, N), self.weight, self.bias)
+
+        # Reshape output to match input's batch dimensions
+        output = output.view(*orig_shape[:-1], self.out_features)
+
+        return output
+
+
+
+def replace_linear_with_rht_quantized_linear(model, weight_bits=8, activation_bits = 8):
+    for name, module in model.named_children():
+        if isinstance(module, torch.nn.Linear):
+            rht_linear = RHTQuantizedLinear(module.in_features, module.out_features, bias=module.bias is not None, weight_bits=weight_bits, activation_bits= activation_bits)
+            rht_linear.weight.data = module.weight.data.clone()
+            if module.bias is not None:
+                rht_linear.bias.data = module.bias.data.clone()
+            setattr(model, name, rht_linear)
+        else:
+            replace_linear_with_rht_quantized_linear(module, weight_bits, activation_bits)
+
+# ===== Main Execution =====
 
 if __name__ == "__main__":
     if not torch.cuda.is_available():
@@ -287,393 +650,6 @@ if __name__ == "__main__":
     
     train_dataloader, val_dataloader, test_dataloader = data._train_dataloader(), data._val_dataloader(), data._test_dataloader()
 
-    # ===== Standard Weight Quantization =====
-
-    def quantize_weights(tensor, num_bits=8):
-        qmin = -(2 ** (num_bits - 1))
-        qmax = (2 ** (num_bits - 1)) - 1
-
-        max_val = tensor.abs().max()
-        if max_val == 0:
-            scale = 1.0
-        else:
-            scale = max_val / qmax
-
-        # Quantize
-        q_x = (tensor / scale).round().clamp(qmin, qmax)
-        # Dequantize
-        dq_x = q_x * scale
-
-        return dq_x
-
-    def quantize_model_weights(model, num_bits=8):
-        for name, module in model.named_modules():
-            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-                with torch.no_grad():
-                    module.weight.data = quantize_weights(module.weight.data, num_bits)
-                    if module.bias is not None:
-                        module.bias.data = quantize_weights(module.bias.data, num_bits)
-    
-    # ===== Standard Dynamic (Uniform) Quantization Activation Functions =====
-
-    def quantize_activation_dynamic(tensor, num_bits):
-        qmin = 0
-        qmax = (2 ** num_bits) - 1
-
-        min_val = tensor.min()
-        max_val = tensor.max()
-        if min_val == max_val:
-            scale = 1.0
-            zero_point = 0
-        else:
-            scale = (max_val - min_val) / (qmax - qmin)
-            zero_point = qmin - min_val / scale
-
-        # Quantize
-        q_x = ((tensor / scale) + zero_point).round().clamp(qmin, qmax)
-        # Dequantize
-        dq_x = (q_x - zero_point) * scale
-
-        return dq_x
-
-    def activation_quantization_dynamic_hook(module, input, output):
-        return quantize_activation_dynamic(output, num_bits=args.activation_quantize_bitwidth)
-
-    def register_activation_quantization_dynamic_hooks(model):
-        handles = []
-        for name, module in model.named_modules():
-            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-                handle = module.register_forward_hook(activation_quantization_dynamic_hook)
-                handles.append(handle)
-        return handles
-
-    # ===== Static Quantization Activation Functions =====
-
-    def collect_activation_ranges(model, dataloader, num_batches, args):
-        activation_ranges = {}
-        module_to_name = {}
-        handles = []
-
-        # Build module_to_name mapping
-        for name, module in model.named_modules():
-            module_to_name[module] = name
-
-        # Define hook to collect activation ranges
-        def collect_activation_ranges_hook(module, input, output):
-            module_name = module_to_name[module]
-            
-            # Handle tensor output
-            if isinstance(output, torch.Tensor):
-                min_val = output.min().item()
-                max_val = output.max().item()
-                if module_name not in activation_ranges:
-                    activation_ranges[module_name] = {'min': min_val, 'max': max_val}
-                else:
-                    activation_ranges[module_name]['min'] = min(activation_ranges[module_name]['min'], min_val)
-                    activation_ranges[module_name]['max'] = max(activation_ranges[module_name]['max'], max_val)
-
-        # Register hooks
-        for name, module in model.named_modules():
-            if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
-                handle = module.register_forward_hook(collect_activation_ranges_hook)
-                handles.append(handle)
-
-        # Run calibration
-        model.eval()
-        with torch.no_grad():
-            for i, batch in enumerate(dataloader):
-                if i >= num_batches:
-                    break
-                
-                try:
-                    # Get x_start and ensure it's in NCHW format
-                    x_start = batch[model.first_stage_key].to(args.device)
-                    if x_start.ndim == 4 and x_start.shape[1] != 3 and x_start.shape[3] == 3:
-                        # Convert from NHWC to NCHW
-                        x_start = x_start.permute(0, 3, 1, 2)
-                    elif x_start.ndim == 3 and x_start.shape[2] == 3:
-                        # Handle case where batch dimension is missing
-                        x_start = x_start.permute(2, 0, 1).unsqueeze(0)
-                    elif x_start.ndim != 4:
-                        print(f"Unexpected x_start shape: {x_start.shape}")
-                        continue
-
-                    # Encode x_start
-                    x_start = model.get_first_stage_encoding(model.encode_first_stage(x_start))
-
-                    # Prepare conditioning
-                    prompts = batch['caption']
-                    conditioning = model.get_learned_conditioning(prompts)
-                    
-                    # Generate noise
-                    noise = torch.randn_like(x_start)
-                    
-                    # Get timesteps
-                    t = torch.randint(0, model.num_timesteps, (x_start.shape[0],), device=args.device).long()
-                    
-                    # Add noise to x_start to get x_noisy
-                    x_noisy = model.q_sample(x_start=x_start, t=t, noise=noise)
-                    
-                    # Apply model to get noise_pred
-                    noise_pred = model.apply_model(x_noisy, t, conditioning)
-                    
-                except Exception as e:
-                    print(f"Error processing batch {i}: {e}")
-                    continue
-
-        # Remove hooks
-        for handle in handles:
-            handle.remove()
-
-        return activation_ranges
-
-
-    # def compute_quantization_parameters(activation_ranges, num_bits):
-    #     """
-    #     Compute quantization parameters using Power of Two scaling for each module
-        
-    #     Args:
-    #         activation_ranges (dict): Dictionary of min/max activation values for each module
-    #         num_bits (int): Number of quantization bits
-        
-    #     Returns:
-    #         dict: Quantization parameters for each module
-    #     """
-    #     quantization_params = {}
-    #     is_signed = False  # Power of Two typically uses unsigned quantization
-    #     qmin = 0
-    #     qmax = 2 ** num_bits - 1
-
-    #     for module_name, ranges in activation_ranges.items():
-    #         min_val = ranges['min']
-    #         max_val = ranges['max']
-            
-    #         # Determine if quantization needs to be symmetric (signed)
-    #         if is_signed:
-    #             # For signed quantization
-    #             act_range = max(abs(min_val), abs(max_val))
-    #             scale = act_range / (qmax / 2)
-    #             # Adjust to power of two
-    #             scale = 2 ** np.floor(np.log2(scale + 1e-8))
-    #             zero_point = 0  # symmetric quantization has zero_point at 0
-    #         else:
-    #             # For unsigned quantization
-    #             # Ensure non-negative range
-    #             min_val = min(0, min_val)
-    #             max_val = max(0, max_val)
-                
-    #             # Compute scale as power of two
-    #             act_range = max_val - min_val
-    #             if act_range == 0:
-    #                 scale = 1.0
-    #                 zero_point = 0
-    #             else:
-    #                 scale = act_range / qmax
-    #                 # Round to next power of two
-    #                 scale = 2 ** np.ceil(np.log2(scale + 1e-8))
-                    
-    #                 # Compute zero point
-    #                 zero_point = qmin - min_val / scale
-    #                 zero_point = np.clip(zero_point, qmin, qmax)
-
-    #         quantization_params[module_name] = {
-    #             'scale': float(scale),
-    #             'zero_point': int(zero_point),
-    #             'qmin': qmin,
-    #             'qmax': qmax
-    #         }
-        
-    #     return quantization_params
-    def compute_quantization_parameters(activation_ranges, num_bits):
-        """
-        Compute quantization parameters using standard uniform quantization for each module
-        
-        Args:
-            activation_ranges (dict): Dictionary of min/max activation values for each module
-            num_bits (int): Number of quantization bits
-        
-        Returns:
-            dict: Quantization parameters for each module
-        """
-        quantization_params = {}
-        qmin = 0
-        qmax = 2 ** num_bits - 1
-
-        for module_name, ranges in activation_ranges.items():
-            min_val = ranges['min']
-            max_val = ranges['max']
-            
-            # For unsigned quantization
-            # Ensure non-negative range
-            # min_val = min(0, min_val)
-            # max_val = max(0, max_val)
-            
-            # Compute scale
-            act_range = max_val - min_val
-            if act_range == 0:
-                scale = 1.0
-                zero_point = 0
-            else:
-                scale = act_range / (qmax - qmin)
-                zero_point = qmin - min_val / scale
-                zero_point = np.clip(zero_point, qmin, qmax)
-
-            quantization_params[module_name] = {
-                'scale': float(scale),
-                'zero_point': int(zero_point),
-                'qmin': qmin,
-                'qmax': qmax
-            }
-        
-        return quantization_params
-
-    def register_activation_quantization_static_hooks(model, quantization_params):
-        """
-        Register static activation quantization hooks for model modules
-        
-        Args:
-            model (torch.nn.Module): Model to quantize
-            quantization_params (dict): Precomputed quantization parameters
-        
-        Returns:
-            list: Handles to registered hooks
-        """
-        module_to_name = {}
-        handles = []
-
-        # Build module_to_name mapping
-        for name, module in model.named_modules():
-            module_to_name[module] = name
-
-        # Define hook for static activation quantization
-        def activation_quantization_static_hook(module, input, output):
-            module_name = module_to_name[module]
-            
-            # Retrieve quantization parameters
-            params = quantization_params.get(module_name, None)
-            if params is None:
-                return output
-            
-            scale = params['scale']
-            zero_point = params['zero_point']
-            qmin = params['qmin']
-            qmax = params['qmax']
-            
-            # Ensure output is a tensor
-            if not isinstance(output, torch.Tensor):
-                return output
-            
-            # Power of Two Quantization Process
-            try:
-                # Quantize: scale, shift, round, and clamp
-                q_x = ((output / scale) + zero_point).round().clamp(qmin, qmax)
-                
-                # Dequantize: shift back and rescale
-                dq_x = (q_x - zero_point) * scale
-                
-                return dq_x
-            except Exception as e:
-                print(f"Quantization error for module {module_name}: {e}")
-                return output
-
-        # Register hooks for specific layer types
-        for name, module in model.named_modules():
-            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d, torch.nn.Conv1d)):
-                handle = module.register_forward_hook(activation_quantization_static_hook)
-                handles.append(handle)
-        
-        return handles
-
-    # ===== Random Hadamard Transform Functions =====
-
-    def generate_random_sign_vector(length, device, dtype):
-        """Generate a random sign vector (+1 or -1) of given length."""
-        return torch.randint(0, 2, (length,), device=device, dtype=dtype) * 2 - 1  # Random +/-1
-
-    def fwht(x):
-        """In-place Fast Walsh-Hadamard Transform of vector x."""
-        N = x.shape[0]
-        h = 1
-        while h < N:
-            # Perform butterfly operations
-            for i in range(0, N, h * 2):
-                a = x[i:i + h]
-                b = x[i + h:i + 2 * h]
-                x[i:i + h] = a + b
-                x[i + h:i + 2 * h] = a - b
-            h *= 2
-        return x
-
-    def apply_random_hadamard_transform(tensor):
-        """Apply random sign flipping and FWHT to the tensor."""
-        original_shape = tensor.shape
-        tensor = tensor.flatten()
-        length = tensor.numel()
-        # Ensure length is a power of two
-        n = 2 ** int(np.ceil(np.log2(length)))
-        pad_length = n - length
-        if pad_length > 0:
-            tensor = torch.cat([tensor, torch.zeros(pad_length, device=tensor.device, dtype=tensor.dtype)])
-        # Random sign flipping
-        sign_vector = generate_random_sign_vector(n, tensor.device, tensor.dtype)
-        tensor = tensor * sign_vector
-        # Apply FWHT
-        tensor = fwht(tensor)
-        return tensor, sign_vector, original_shape, pad_length
-
-    def reverse_random_hadamard_transform(tensor, sign_vector, original_shape, pad_length):
-        """Reverse the FWHT and random sign flipping."""
-        # Apply FWHT (inverse of FWHT is itself)
-        tensor = fwht(tensor)
-        # Reverse sign flipping
-        tensor = tensor * sign_vector
-        # Remove padding if any
-        if pad_length > 0:
-            tensor = tensor[:-pad_length]
-        tensor = tensor.view(original_shape)
-        return tensor
-    
-    # ===== Weight Quantization with Random Hadamard Transform =====
-
-    def RHT_quantize_model_weights(model, num_bits=8):
-        for name, module in model.named_modules():
-            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-                with torch.no_grad():
-                    # Flatten weight tensor
-                    weight = module.weight.data
-                    transformed_weight, sign_vector, original_shape, pad_length = apply_random_hadamard_transform(weight)
-                    # Quantize transformed weights
-                    quantized_weight = quantize_weights(transformed_weight, num_bits)
-                    # Reverse Hadamard transform
-                    recovered_weight = reverse_random_hadamard_transform(quantized_weight, sign_vector, original_shape, pad_length)
-                    module.weight.data.copy_(recovered_weight.view(original_shape))
-                    if module.bias is not None:
-                        # Quantize biases normally (or apply similar transform if desired)
-                        module.bias.data.copy_(quantize_weights(module.bias.data, num_bits))
-
-    # ===== Dynamic Activation Quantization with Random Hadamard Transform =====
-
-    def RHT_activation_quantization_dynamic_hook(module, input, output):
-        if not isinstance(output, torch.Tensor):
-            return output
-        with torch.no_grad():
-            # Flatten output tensor
-            output_flat = output.view(-1)
-            transformed_output, sign_vector, original_shape, pad_length = apply_random_hadamard_transform(output_flat)
-            # Quantize transformed activations
-            quantized_output = quantize_activation_dynamic(transformed_output, num_bits=args.activation_quantize_bitwidth)
-            # Reverse Hadamard transform
-            recovered_output = reverse_random_hadamard_transform(quantized_output, sign_vector, original_shape, pad_length)
-            return recovered_output.view(output.shape)
-
-    def RHT_register_activation_quantization_dynamic_hooks(model):
-        handles = []
-        for name, module in model.named_modules():
-            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-                handle = module.register_forward_hook(RHT_activation_quantization_dynamic_hook)
-                handles.append(handle)
-        return handles
-
     # load from checkpoint
     if args.checkpoint is None or not os.path.isfile(args.checkpoint):
         print("\nNo checkpoint found! Proceeding without checkpoint.")
@@ -694,43 +670,19 @@ if __name__ == "__main__":
 
     args.calibrating_range = False # this tells DDIM sampler when to print clip_vals
     model.args = args
-    
-    # if args.accelerate:
-    #     model, train_dataloader, val_dataloader, test_dataloader = args.accelerator.prepare(model, train_dataloader, val_dataloader, test_dataloader)
-    #     args.train_dataloader_len = len(train_dataloader)
-    #     args.val_dataloader_len = len(val_dataloader)
-    #     args.test_dataloader_len = len(test_dataloader)
 
     # Apply quantization before moving the model to GPU
-    if args.dynamic_quantize:
-        print(f"Applying dynamic  quantization (W{args.weight_quantize_bitwidth}A{args.activation_quantize_bitwidth}) to the model's Linear and Conv2d layers...")
-        quantize_model_weights(model.model, num_bits=args.weight_quantize_bitwidth)
-        activation_quantization_handles = register_activation_quantization_dynamic_hooks(model.model)
-
+    if args.static_quantize:
         model = model.to(args.device)
-        
-    elif args.static_quantize:
-        model = model.to(args.device)
-        
-        print(f"Applying static quantization (W{args.weight_quantize_bitwidth}A{args.activation_quantize_bitwidth}) to the model's Linear and Conv2d layers...")
-        quantize_model_weights(model.model, num_bits=args.weight_quantize_bitwidth)
-        # Collect activation ranges
         num_calibration_batches = 10
+        print(f"Collecting activation ranges for static quantization using {num_calibration_batches} batches...")
         activation_ranges = collect_activation_ranges(model, train_dataloader, num_calibration_batches, args)
-
-        # Compute quantization parameters
         quantization_params = compute_quantization_parameters(activation_ranges, args.activation_quantize_bitwidth)
-
-        # Register static quantization hooks
-        activation_quantization_handles = register_activation_quantization_static_hooks(model, quantization_params)
-
-    elif args.rht_quant:
-        print(f"Applying dynamic quantization with Random Hadamard Transform (W{args.weight_quantize_bitwidth}A{args.activation_quantize_bitwidth}) to the model's Linear and Conv2d layers...")
-        print("Quantizing Weights Now")
-        RHT_quantize_model_weights(model.model, num_bits=args.weight_quantize_bitwidth)
-        print("Quantizing activation hooks")
-        activation_quantization_handles = RHT_register_activation_quantization_dynamic_hooks(model.model)
-
+        quantize_weights(model.model, args)
+        quantize_activations(model.model, args, activation_ranges=quantization_params)
+    elif args.dynamic_quantize:
+        quantize_weights(model.model, args)
+        quantize_activations(model.model, args)
         model = model.to(args.device)
     else:
         model = model.to(args.device)
