@@ -27,6 +27,7 @@ from ldm.data.coco import CocoImagesAndCaptionsTrain2017, CocoImagesAndCaptionsV
 from ldm.util import instantiate_from_config, str_or_int
 from ldm.eval.clip_score import CLIPScore
 from ldm.eval.fid_score import FrechetInceptionDistance
+from ldm.modules.attention import CrossAttention
 
 parser = argparse.ArgumentParser()
 
@@ -220,11 +221,15 @@ def evaluate_accuracy(model, dataloader=None, args=None):
 
 def quantize_weights(model, args):
     if args.rht_quant:
-        print(f"Applying RHT quantization (W{args.weight_quantize_bitwidth}A{args.activation_quantize_bitwidth} bits) to the model's Linear layers...")
-        replace_linear_with_rht_quantized_linear(model, args.weight_quantize_bitwidth, args.activation_quantize_bitwidth)
-        for name, module in model.named_modules():
+        print(f"Applying RHT quantization (W{args.weight_quantize_bitwidth}A{args.activation_quantize_bitwidth} bits) to the model's Linear layers and attention modules...")
+        # Replace Linear layers outside attention modules
+        replace_linear_with_rht_quantized_linear(model.model, args.weight_quantize_bitwidth, args.activation_quantize_bitwidth)
+        # Quantize weights of RHTQuantizedLinear layers
+        for name, module in model.model.named_modules():
             if isinstance(module, RHTQuantizedLinear):
                 module.quantize_weight()
+        # Replace attention modules with RHTQuantizedAttention
+        replace_attention_with_rht_quantized_attention(model.model, args.weight_quantize_bitwidth, args.activation_quantize_bitwidth)
     else:
         print(f"Applying {'dynamic' if args.dynamic_quantize else 'static'} quantization (W{args.weight_quantize_bitwidth} bits) to the model's Linear and Conv2d layers...")
         for name, module in model.named_modules():
@@ -261,34 +266,35 @@ def quantize_activations(model, args, activation_ranges=None):
 # ===== Helper Functions =====
 
 def quantize_tensor_min_max(tensor, num_bits=8, signed=True):
-    """
-    Quantizes a tensor using standard min-max uniform quantization,
-    then immediately dequantizes it back to floating-point format.
-    """
     if signed:
-        qmin = -(2 ** (num_bits - 1))
-        qmax = (2 ** (num_bits - 1)) - 1
+        qmin = -(2 ** (num_bits - 1) - 1)
+        qmax = (2 ** (num_bits - 1) - 1)
+        zero_point = 0
+        max_abs = tensor.abs().max()
+        if max_abs == 0:
+            scale = 1.0
+        else:
+            scale = max_abs / qmax
     else:
         qmin = 0
         qmax = (2 ** num_bits) - 1
+        min_val = tensor.min()
+        max_val = tensor.max()
+        if min_val == max_val:
+            scale = 1.0
+            zero_point = 0
+        else:
+            scale = (max_val - min_val) / (qmax - qmin)
+            zero_point = qmin - min_val / scale
 
-    min_val = tensor.min()
-    max_val = tensor.max()
-    if min_val == max_val:
-        scale = 1.0
-        zero_point = 0
-        q_x = torch.zeros_like(tensor)
-    else:
-        scale = (max_val - min_val) / (qmax - qmin)
-        zero_point = qmin - min_val / scale
-
-        # Quantize
-        q_x = ((tensor / scale) + zero_point).round().clamp(qmin, qmax)
+    # Quantize
+    q_x = ((tensor / scale) + zero_point).round().clamp(qmin, qmax)
 
     # Dequantize
     deq_x = (q_x - zero_point) * scale
 
     return deq_x
+
 
 def quantize_and_dequantize_tensor(tensor, scale, zero_point, qmin, qmax):
     """
@@ -459,14 +465,11 @@ def fwht(x):
     """Fast Walsh-Hadamard Transform along the last dimension."""
     orig_shape = x.shape
     N = x.shape[-1]
-    if (N & (N - 1)) != 0:
-        # Pad to next power of two
-        N_padded = 2 ** int(np.ceil(np.log2(N)))
-        pad_size = N_padded - N
+    N_padded = 2 ** int(np.ceil(np.log2(N))) if (N & (N - 1)) != 0 else N
+    pad_size = N_padded - N if N_padded != N else 0
+
+    if pad_size > 0:
         x = F.pad(x, (0, pad_size))
-    else:
-        N_padded = N
-        pad_size = 0
 
     x = x.reshape(-1, N_padded)
     h = 1
@@ -479,15 +482,18 @@ def fwht(x):
         h *= 2
 
     x = x.reshape(*orig_shape[:-1], N_padded)
-
     if pad_size > 0:
         x = x[..., :N]
+
+    # Normalize the transform
+    x = x / np.sqrt(N_padded)
 
     return x
 
 
+
 class RHTQuantizedLinear(torch.nn.Linear):
-    def __init__(self, in_features, out_features, bias=True, weight_bits = 8, activation_bits=8):
+    def __init__(self, in_features, out_features, bias=True, weight_bits=8, activation_bits=8):
         super(RHTQuantizedLinear, self).__init__(in_features, out_features, bias)
         self.weight_bits = weight_bits
         self.activation_bits = activation_bits
@@ -495,34 +501,37 @@ class RHTQuantizedLinear(torch.nn.Linear):
 
     def quantize_weight(self):
         with torch.no_grad():
-            # Generate random sign vector
+            # Generate random sign vector of shape [in_features]
             self.sign_vector = generate_random_sign_vector(self.in_features, self.weight.device, self.weight.dtype)
             N = self.in_features
-            weight = self.weight.data
+            weight = self.weight.data  # Shape: [out_features, in_features]
 
-            # Pad weight if necessary
-            if (N & (N - 1)) != 0:
-                N_padded = 2 ** int(np.ceil(np.log2(N)))
-                pad_size = N_padded - N
+            # Pad if necessary
+            N_padded = 2 ** int(np.ceil(np.log2(N))) if (N & (N - 1)) != 0 else N
+            pad_size = N_padded - N if N_padded != N else 0
+
+            if pad_size > 0:
                 weight = F.pad(weight, (0, pad_size))
                 sign_vector = F.pad(self.sign_vector, (0, pad_size), value=1)
             else:
-                pad_size = 0
                 sign_vector = self.sign_vector
 
-            # Apply sign flipping and Hadamard transform to weights
+            # Apply sign flipping and FWHT
             weight = weight * sign_vector.unsqueeze(0)
-            weight = fwht(weight)
+            weight = fwht(weight)  # Apply along last dimension
+
+            # Normalize
+            weight = weight / np.sqrt(N_padded)
 
             # Quantize and dequantize transformed weights
-            deq_w = quantize_tensor_min_max(weight, self.weight_bits, signed=True)
+            deq_weight = quantize_tensor_min_max(weight, self.weight_bits, signed=True)
 
             # Remove padding if necessary
             if pad_size > 0:
-                deq_w = deq_w[:, :N]
+                deq_weight = deq_weight[..., :N]
 
             # Assign dequantized weights back to self.weight.data
-            self.weight.data.copy_(deq_w)
+            self.weight.data.copy_(deq_weight)
 
             # Quantize and dequantize bias if present
             if self.bias is not None:
@@ -534,55 +543,191 @@ class RHTQuantizedLinear(torch.nn.Linear):
             raise ValueError("Weights not quantized. Call quantize_weight() before inference.")
 
         N = self.in_features
-        orig_shape = input.shape
-        last_dim = input.shape[-1]
+        x = input  # Shape: [..., N]
 
-        if last_dim != N:
-            raise ValueError(f"Input has last dimension {last_dim}, expected {N}")
+        # Pad if necessary
+        N_padded = 2 ** int(np.ceil(np.log2(N))) if (N & (N - 1)) != 0 else N
+        pad_size = N_padded - N if N_padded != N else 0
 
-        x = input
-
-        # Pad input if necessary
-        if (N & (N - 1)) != 0:
-            N_padded = 2 ** int(np.ceil(np.log2(N)))
-            pad_size = N_padded - N
+        if pad_size > 0:
             x = F.pad(x, (0, pad_size))
             sign_vector = F.pad(self.sign_vector, (0, pad_size), value=1)
         else:
-            pad_size = 0
             sign_vector = self.sign_vector
 
-        # Apply sign flipping and Hadamard transform to input
+        # Apply sign flipping and FWHT
         x = x * sign_vector
-        x = fwht(x)
+        x = fwht(x)  # Apply along last dimension
+
+        # Normalize
+        x = x / np.sqrt(N_padded)
 
         # Quantize and dequantize input
-        deq_x = quantize_tensor_min_max(x, num_bits=self.activation_bits, signed=False)
+        x = quantize_tensor_min_max(x, num_bits=self.activation_bits, signed=True)
 
         # Remove padding if necessary
         if pad_size > 0:
-            deq_x = deq_x[..., :N]
+            x = x[..., :N]
 
-        # Perform linear operation using dequantized weights and inputs
-        output = F.linear(deq_x.view(-1, N), self.weight, self.bias)
-
-        # Reshape output to match input's batch dimensions
-        output = output.view(*orig_shape[:-1], self.out_features)
+        # Perform linear operation
+        output = F.linear(x, self.weight, self.bias)
 
         return output
 
+class RHTQuantizedAttention(nn.Module):
+    def __init__(self, attention_module, weight_bits=8, activation_bits=8):
+        super(RHTQuantizedAttention, self).__init__()
+        self.attention = attention_module
+        self.weight_bits = weight_bits
+        self.activation_bits = activation_bits
+        self.apply_rht_to_attention()
+    
+    def apply_rht_to_attention(self):
+        with torch.no_grad():
+            # Extract weight matrices
+            Wq = self.attention.to_q.weight.data  # Shape: [out_features, in_features]
+            Wk = self.attention.to_k.weight.data
+            Wv = self.attention.to_v.weight.data
+            Wout = self.attention.to_out[0].weight.data  # Assuming to_out is a Sequential
 
+            # Generate random sign vector for input dimension
+            N = Wq.shape[1]  # Input dimension
+            device = Wq.device
+            dtype = Wq.dtype
+            self.sign_vector = generate_random_sign_vector(N, device, dtype)
 
-def replace_linear_with_rht_quantized_linear(model, weight_bits=8, activation_bits = 8):
+            # Apply RHT to Wq, Wk, Wv
+            Wq = self.apply_rht_to_weight(Wq, self.sign_vector)
+            Wk = self.apply_rht_to_weight(Wk, self.sign_vector)
+            Wv = self.apply_rht_to_weight(Wv, self.sign_vector)
+
+            # Quantize weights
+            Wq = quantize_tensor_min_max(Wq, self.weight_bits, signed=True)
+            Wk = quantize_tensor_min_max(Wk, self.weight_bits, signed=True)
+            Wv = quantize_tensor_min_max(Wv, self.weight_bits, signed=True)
+
+            # Update weights
+            self.attention.to_q.weight.data.copy_(Wq)
+            self.attention.to_k.weight.data.copy_(Wk)
+            self.attention.to_v.weight.data.copy_(Wv)
+
+            # Generate random sign vector for output dimension
+            M = Wout.shape[0]  # Output dimension
+            self.sign_vector_out = generate_random_sign_vector(M, device, dtype)
+
+            # Apply RHT to Wout along the output dimension
+            Wout = self.apply_rht_to_weight_output(Wout, self.sign_vector_out)
+
+            # Quantize Wout
+            Wout = quantize_tensor_min_max(Wout, self.weight_bits, signed=True)
+
+            # Update Wout
+            self.attention.to_out[0].weight.data.copy_(Wout)
+
+            # Quantize biases if present
+            if self.attention.to_q.bias is not None:
+                bq = quantize_tensor_min_max(self.attention.to_q.bias.data, self.weight_bits, signed=True)
+                self.attention.to_q.bias.data.copy_(bq)
+            if self.attention.to_k.bias is not None:
+                bk = quantize_tensor_min_max(self.attention.to_k.bias.data, self.weight_bits, signed=True)
+                self.attention.to_k.bias.data.copy_(bk)
+            if self.attention.to_v.bias is not None:
+                bv = quantize_tensor_min_max(self.attention.to_v.bias.data, self.weight_bits, signed=True)
+                self.attention.to_v.bias.data.copy_(bv)
+            if self.attention.to_out[0].bias is not None:
+                bout = quantize_tensor_min_max(self.attention.to_out[0].bias.data, self.weight_bits, signed=True)
+                self.attention.to_out[0].bias.data.copy_(bout)
+
+    def apply_rht_to_weight(self, weight, sign_vector):
+        # weight: [out_features, in_features]
+        N = weight.shape[1]
+        pad_size = (2 ** int(np.ceil(np.log2(N)))) - N if (N & (N - 1)) != 0 else 0
+        if pad_size > 0:
+            weight = F.pad(weight, (0, pad_size))
+            sign_vector = F.pad(sign_vector, (0, pad_size), value=1)
+        weight = weight * sign_vector.unsqueeze(0)
+        weight = fwht(weight)  # Apply FWHT along the last dimension
+        weight = weight / np.sqrt(weight.shape[1])
+        if pad_size > 0:
+            weight = weight[:, :N]
+        return weight
+
+    def apply_rht_to_weight_output(self, weight, sign_vector):
+        # weight: [out_features, in_features]
+        M = weight.shape[0]
+        pad_size = (2 ** int(np.ceil(np.log2(M)))) - M if (M & (M - 1)) != 0 else 0
+        if pad_size > 0:
+            weight = F.pad(weight, (pad_size, 0))  # Pad the output dimension
+            sign_vector = F.pad(sign_vector, (pad_size, 0), value=1)
+        weight = sign_vector.unsqueeze(1) * weight
+        weight = fwht(weight)  # Apply FWHT along the first dimension
+        weight = weight / np.sqrt(weight.shape[0])
+        if pad_size > 0:
+            weight = weight[pad_size:, :]
+        return weight
+
+    def forward(self, x, context=None, mask=None):
+        N = x.shape[-1]
+        pad_size = (2 ** int(np.ceil(np.log2(N)))) - N if (N & (N - 1)) != 0 else 0
+        sign_vector = self.sign_vector
+        if pad_size > 0:
+            x = F.pad(x, (0, pad_size))
+            sign_vector = F.pad(sign_vector, (0, pad_size), value=1)
+        # Apply sign vector and FWHT
+        x = x * sign_vector
+        x = fwht(x)
+        x = x / np.sqrt(x.shape[-1])
+        # Quantize input
+        x = quantize_tensor_min_max(x, num_bits=self.activation_bits, signed=True)
+        if pad_size > 0:
+            x = x[..., :N]
+        # Pass through attention
+        out = self.attention(x, context=context, mask=mask)
+        # Apply RHT to output
+        M = out.shape[-1]
+        pad_size_out = (2 ** int(np.ceil(np.log2(M)))) - M if (M & (M - 1)) != 0 else 0
+        sign_vector_out = self.sign_vector_out
+        if pad_size_out > 0:
+            out = F.pad(out, (0, pad_size_out))
+            sign_vector_out = F.pad(sign_vector_out, (0, pad_size_out), value=1)
+        out = fwht(out)
+        out = out * sign_vector_out
+        out = out / np.sqrt(out.shape[-1])
+        # Quantize output
+        out = quantize_tensor_min_max(out, num_bits=self.activation_bits, signed=True)
+        if pad_size_out > 0:
+            out = out[..., :M]
+        return out
+    
+
+def replace_attention_with_rht_quantized_attention(model, weight_bits=8, activation_bits=8):
     for name, module in model.named_children():
+        if isinstance(module, CrossAttention):
+            rht_attention = RHTQuantizedAttention(module, weight_bits=weight_bits, activation_bits=activation_bits)
+            setattr(model, name, rht_attention)
+        else:
+            replace_attention_with_rht_quantized_attention(module, weight_bits, activation_bits)
+
+
+def replace_linear_with_rht_quantized_linear(model, weight_bits=8, activation_bits=8, parent_module=None):
+    for name, module in model.named_children():
+        full_name = f"{parent_module}.{name}" if parent_module else name
+
         if isinstance(module, torch.nn.Linear):
-            rht_linear = RHTQuantizedLinear(module.in_features, module.out_features, bias=module.bias is not None, weight_bits=weight_bits, activation_bits= activation_bits)
+            # Check if parent is an attention module
+            if isinstance(parent_module, CrossAttention):
+                continue  # Skip linear layers inside attention modules
+            rht_linear = RHTQuantizedLinear(module.in_features, module.out_features,
+                                            bias=module.bias is not None, weight_bits=weight_bits,
+                                            activation_bits=activation_bits)
             rht_linear.weight.data = module.weight.data.clone()
             if module.bias is not None:
                 rht_linear.bias.data = module.bias.data.clone()
             setattr(model, name, rht_linear)
         else:
-            replace_linear_with_rht_quantized_linear(module, weight_bits, activation_bits)
+            # Recurse into child modules
+            replace_linear_with_rht_quantized_linear(module, weight_bits, activation_bits, parent_module=module)
+
 
 # ===== Main Execution =====
 
