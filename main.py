@@ -262,8 +262,8 @@ def quantize_activations(model, args, activation_ranges=None):
 
 def quantize_tensor_min_max(tensor, num_bits=8, signed=True):
     if signed:
-        qmin = -(2 ** (num_bits - 1) - 1)
-        qmax = (2 ** (num_bits - 1) - 1)
+        qmin = - (2 ** (num_bits - 1))
+        qmax = (2 ** (num_bits - 1)) - 1
         zero_point = 0
         max_abs = tensor.abs().max()
         if max_abs == 0:
@@ -289,6 +289,7 @@ def quantize_tensor_min_max(tensor, num_bits=8, signed=True):
     deq_x = (q_x - zero_point) * scale
 
     return deq_x
+
 
 
 def quantize_and_dequantize_tensor(tensor, scale, zero_point, qmin, qmax):
@@ -457,7 +458,7 @@ def generate_random_sign_vector(length, device, dtype):
     return torch.randint(0, 2, (length,), device=device, dtype=dtype) * 2 - 1  # Random +/-1
 
 def fwht(x):
-    """Fast Walsh-Hadamard Transform along the last dimension."""
+    """Fast Walsh-Hadamard Transform along the last dimension without normalization."""
     orig_shape = x.shape
     N = x.shape[-1]
     N_padded = 2 ** int(np.ceil(np.log2(N))) if (N & (N - 1)) != 0 else N
@@ -467,21 +468,24 @@ def fwht(x):
         x = F.pad(x, (0, pad_size))
 
     x = x.reshape(-1, N_padded)
-    h = 1
-    while h < N_padded:
-        for i in range(0, N_padded, h * 2):
-            a = x[:, i:i + h]
-            b = x[:, i + h:i + 2 * h]
-            x[:, i:i + h] = a + b
-            x[:, i + h:i + 2 * h] = a - b
-        h *= 2
+    batch_dim, d = x.shape
+
+    h = 2
+    while h <= d:
+        hf = h >> 1
+        x = x.view(batch_dim, d // h, h)
+        a = x[:, :, :hf]
+        b = x[:, :, hf:]
+        # In-place butterfly
+        tmp = a.clone()
+        a.add_(b)
+        b.mul_(-1).add_(tmp)
+        x = x.view(batch_dim, d)
+        h <<= 1
 
     x = x.reshape(*orig_shape[:-1], N_padded)
     if pad_size > 0:
         x = x[..., :N]
-
-    # Normalize the transform
-    x = x / np.sqrt(N_padded)
 
     return x
 
@@ -493,39 +497,38 @@ class RHTQuantizedLinear(torch.nn.Linear):
         self.weight_bits = weight_bits
         self.activation_bits = activation_bits
         self.register_buffer('sign_vector', None)
+        self.N_padded = None  # Store padded size
 
     def quantize_weight(self):
         with torch.no_grad():
-            # Generate random sign vector of shape [in_features]
-            self.sign_vector = generate_random_sign_vector(self.in_features, self.weight.device, self.weight.dtype)
             N = self.in_features
+            self.sign_vector = generate_random_sign_vector(N, self.weight.device, self.weight.dtype)
             weight = self.weight.data  # Shape: [out_features, in_features]
 
             # Pad if necessary
             N_padded = 2 ** int(np.ceil(np.log2(N))) if (N & (N - 1)) != 0 else N
-            pad_size = N_padded - N if N_padded != N else 0
+            self.N_padded = N_padded
+            pad_size = N_padded - N
 
             if pad_size > 0:
-                weight = F.pad(weight, (0, pad_size))
+                weight = F.pad(weight, (0, pad_size))  # Pad last dimension (input dimension)
                 sign_vector = F.pad(self.sign_vector, (0, pad_size), value=1)
             else:
                 sign_vector = self.sign_vector
 
-            # Apply sign flipping and FWHT
+            # Apply Hadamard transform to weights: W H
+            weight = fwht(weight)  # Apply FWHT along the last dimension (input dimension)
+
+            # Apply sign vector after FWHT
             weight = weight * sign_vector.unsqueeze(0)
-            weight = fwht(weight)  # Apply along last dimension
 
-            # Normalize
-            weight = weight / np.sqrt(N_padded)
-
-            # Quantize and dequantize transformed weights
+            # Quantize and dequantize transformed weights (use signed quantization)
             deq_weight = quantize_tensor_min_max(weight, self.weight_bits, signed=True)
 
             # Remove padding if necessary
             if pad_size > 0:
-                deq_weight = deq_weight[..., :N]
+                deq_weight = deq_weight[:, :N]
 
-            # Assign dequantized weights back to self.weight.data
             self.weight.data.copy_(deq_weight)
 
             # Quantize and dequantize bias if present
@@ -534,15 +537,12 @@ class RHTQuantizedLinear(torch.nn.Linear):
                 self.bias.data.copy_(deq_b)
 
     def forward(self, input):
-        if self.sign_vector is None:
+        if self.sign_vector is None or self.N_padded is None:
             raise ValueError("Weights not quantized. Call quantize_weight() before inference.")
 
         N = self.in_features
         x = input  # Shape: [..., N]
-
-        # Pad if necessary
-        N_padded = 2 ** int(np.ceil(np.log2(N))) if (N & (N - 1)) != 0 else N
-        pad_size = N_padded - N if N_padded != N else 0
+        pad_size = self.N_padded - N
 
         if pad_size > 0:
             x = F.pad(x, (0, pad_size))
@@ -550,17 +550,15 @@ class RHTQuantizedLinear(torch.nn.Linear):
         else:
             sign_vector = self.sign_vector
 
-        # Apply sign flipping and FWHT
+        # Apply Hadamard transform to inputs: H x
+        x = fwht(x)
+
+        # Apply sign vector after FWHT
         x = x * sign_vector
-        x = fwht(x)  # Apply along last dimension
-
-        # Normalize
-        x = x / np.sqrt(N_padded)
-
-        # Quantize and dequantize input
+        
+        # Quantize and dequantize input (use signed quantization)
         x = quantize_tensor_min_max(x, num_bits=self.activation_bits, signed=True)
 
-        # Remove padding if necessary
         if pad_size > 0:
             x = x[..., :N]
 
@@ -568,7 +566,6 @@ class RHTQuantizedLinear(torch.nn.Linear):
         output = F.linear(x, self.weight, self.bias)
 
         return output
-
 
 
 
