@@ -169,7 +169,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
 def evaluate_accuracy(model, dataloader=None, args=None):
     model.eval()
     save_dir = f'./results/{args.experiment_str}/'
-    
+
     if args.monitor_fid:
         acc_metric = FrechetInceptionDistance().set_dtype(torch.float64).to(args.device)
     else:
@@ -185,15 +185,16 @@ def evaluate_accuracy(model, dataloader=None, args=None):
             # check if we want to plot this batch
             plot = args.plot and (i < 20)
             activations = args.activations
-            
+
             batch[model.first_stage_key] = batch[model.first_stage_key].to(args.device)
             samples, images, prompts = model.sample_images(batch, batch_idx=i, epoch=None, save_dir=save_dir, plot=plot, activations = activations)
 
             if (plot and args.plot_only) or activations:
                 exit()
-            
+
             # save the first 10 images, and then save one image every 100 iterations
             if args.evaluate and args.save_images and (args.accelerator is None or args.accelerator.is_main_process) and (i < 10 or i % 100 == 0):
+                print("saving image")
                 filename = f"{i:05}.png"
                 path = os.path.join(images_dir, filename)
                 sample = rearrange(samples[0].detach().cpu().numpy(), 'c h w -> h w c')
@@ -213,7 +214,7 @@ def evaluate_accuracy(model, dataloader=None, args=None):
                 print(f'\tbatch {i}/{len(dataloader)}: test acc {acc_so_far:.2f}')
 
     test_acc = acc_metric.compute().detach().cpu().numpy()
-    
+
     return test_acc
 
 # ===== Main Quantization Functions =====
@@ -221,10 +222,49 @@ def evaluate_accuracy(model, dataloader=None, args=None):
 def quantize_weights(model, args):
     if args.rht_quant:
         print(f"Applying RHT quantization (W{args.weight_quantize_bitwidth}A{args.activation_quantize_bitwidth} bits) to the model's Linear layers...")
-        replace_linear_with_rht_quantized_linear(model, args.weight_quantize_bitwidth, args.activation_quantize_bitwidth)
         for name, module in model.named_modules():
-            if isinstance(module, RHTQuantizedLinear):
-                module.quantize_weight()
+            if isinstance(module, torch.nn.Linear):
+                with torch.no_grad():
+                    # Quantize and dequantize weights
+                    N = module.in_features
+                    
+                    sign_vector = generate_random_sign_vector(N, module.weight.device, module.weight.dtype)
+                    
+                    weight = module.weight.data  # Shape: [out_features, in_features]
+
+                    # Pad if necessary
+                    N_padded = 2 ** int(np.ceil(np.log2(N))) if (N & (N - 1)) != 0 else N
+                    N_padded = N_padded
+                    pad_size = N_padded - N
+
+                    if pad_size > 0:
+                        weight = F.pad(weight, (0, pad_size))  # Pad last dimension (input dimension)
+                        sign_vector = F.pad(sign_vector, (0, pad_size), value=1)
+                    else:
+                        sign_vector = sign_vector
+                    
+                    # Apply Hadamard transform to weights: W H
+                    weight_prime = fwht(weight) * sign_vector
+
+                    # deq_w = quantize_tensor_min_max(weight_prime, args.weight_quantize_bitwidth, signed=True)
+                    deq_w = weight_prime
+
+                    # Unpad if needed
+                    if pad_size > 0:
+                        deq_w = deq_w[:, :N]
+
+                    module.weight.data.copy_(deq_w)
+
+                    # Quantize and dequantize bias if present
+                    # if module.bias is not None:
+                    #     deq_b = quantize_tensor_min_max(module.bias.data, args.weight_quantize_bitwidth, signed=True)
+                    #     module.bias.data.copy_(deq_b)
+                    
+                    # Store sign_vector and padding info in the module
+                    # We'll need this during activation quantization
+                    module.register_buffer('rht_sign_vector', sign_vector)
+                    module.rht_N_padded = N_padded
+
     else:
         print(f"Applying {'dynamic' if args.dynamic_quantize else 'static'} quantization (W{args.weight_quantize_bitwidth} bits) to the model's Linear and Conv2d layers...")
         for name, module in model.named_modules():
@@ -238,14 +278,14 @@ def quantize_weights(model, args):
                     if module.bias is not None:
                         deq_b = quantize_tensor_min_max(module.bias.data, args.weight_quantize_bitwidth, signed=True)
                         module.bias.data.copy_(deq_b)
-                        
+
 def quantize_activations(model, args, activation_ranges=None):
     """
     Main activation quantization function that handles different quantization modes.
     """
     if args.rht_quant:
-        # For RHT quantization, activations are quantized within the RHTQuantizedLinear class
-        pass
+        print(f"Applying RHT incoherence processing and dynamic activation quantization (A{args.activation_quantize_bitwidth} bits)...")
+        register_activation_quantization_hooks(model, args, activation_ranges=None)
     else:
         if args.dynamic_quantize:
             print(f"Applying dynamic activation quantization (A{args.activation_quantize_bitwidth} bits)...")
@@ -291,7 +331,6 @@ def quantize_tensor_min_max(tensor, num_bits=8, signed=True):
     return deq_x
 
 
-
 def quantize_and_dequantize_tensor(tensor, scale, zero_point, qmin, qmax):
     """
     Quantizes and immediately dequantizes a tensor using provided scale and zero_point.
@@ -311,6 +350,36 @@ def register_activation_quantization_hooks(model, args, activation_ranges=None):
     for name, module in model.named_modules():
         module_to_name[module] = name
 
+    def rht_activation_pre_hook(module, input):
+        # This pre-hook transforms the input activations using the RHT logic
+        # only if rht_sign_vector exists in the module.
+        if not hasattr(module, 'rht_sign_vector'):
+            print("FUCK")
+            return input
+        
+        x = input[0]
+        N = module.in_features
+    
+        sign_vector = module.rht_sign_vector
+        N_padded = module.rht_N_padded
+        pad_size = N_padded - N
+
+        # Pad input if needed
+        if pad_size > 0:
+            x = F.pad(x, (0, pad_size))
+
+        # Apply Hadamard transform
+        x = fwht(x * sign_vector)
+        
+        # Quantize activations
+        # x = quantize_tensor_min_max(x, num_bits=args.activation_quantize_bitwidth, signed=True)
+
+        # Remove padding if applied
+        if pad_size > 0:
+            x = x[..., :N]
+
+        return (x,)
+    
     # Define hook for activation quantization
     def activation_quantization_hook(module, input, output):
         module_name = module_to_name[module]
@@ -335,10 +404,20 @@ def register_activation_quantization_hooks(model, args, activation_ranges=None):
             return output
 
     # Register hooks for specific layer types
-    for name, module in model.named_modules():
-        if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-            handle = module.register_forward_hook(activation_quantization_hook)
-            handles.append(handle)
+    if args.rht_quant:
+        print("Registering RHT hooks for linear layers...")
+        # For RHT, we do a forward_pre_hook to handle input transformations before the linear layer
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                # Add forward pre-hook for RHT transform
+                handle = module.register_forward_pre_hook(rht_activation_pre_hook)
+                handles.append(handle)
+    else:
+        print ("Registering hooks for normal dynamic/static quantization...")
+        for name, module in model.named_modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                handle = module.register_forward_hook(activation_quantization_hook)
+                handles.append(handle)
 
     return handles
 
@@ -354,7 +433,7 @@ def collect_activation_ranges(model, dataloader, num_batches, args):
     # Define hook to collect activation ranges
     def collect_activation_ranges_hook(module, input, output):
         module_name = module_to_name[module]
-        
+
         # Handle tensor output
         if isinstance(output, torch.Tensor):
             min_val = output.min().item()
@@ -377,7 +456,7 @@ def collect_activation_ranges(model, dataloader, num_batches, args):
         for i, batch in enumerate(dataloader):
             if i >= num_batches:
                 break
-            
+
             try:
                 # Get x_start and ensure it's in NCHW format
                 x_start = batch[model.first_stage_key].to(args.device)
@@ -397,19 +476,19 @@ def collect_activation_ranges(model, dataloader, num_batches, args):
                 # Prepare conditioning
                 prompts = batch['caption']
                 conditioning = model.get_learned_conditioning(prompts)
-                
+
                 # Generate noise
                 noise = torch.randn_like(x_start)
-                
+
                 # Get timesteps
                 t = torch.randint(0, model.num_timesteps, (x_start.shape[0],), device=args.device).long()
-                
+
                 # Add noise to x_start to get x_noisy
                 x_noisy = model.q_sample(x_start=x_start, t=t, noise=noise)
-                
+
                 # Apply model to get noise_pred
                 noise_pred = model.apply_model(x_noisy, t, conditioning)
-                
+
             except Exception as e:
                 print(f"Error processing batch {i}: {e}")
                 continue
@@ -431,7 +510,7 @@ def compute_quantization_parameters(activation_ranges, num_bits):
     for module_name, ranges in activation_ranges.items():
         min_val = ranges['min']
         max_val = ranges['max']
-        
+
         # Compute scale
         act_range = max_val - min_val
         if act_range == 0:
@@ -448,7 +527,7 @@ def compute_quantization_parameters(activation_ranges, num_bits):
             'qmin': qmin,
             'qmax': qmax
         }
-    
+
     return quantization_params
 
 # ===== Random Hadamard Transform Functions =====
@@ -459,126 +538,117 @@ def generate_random_sign_vector(length, device, dtype):
 
 def fwht(x):
     """Fast Walsh-Hadamard Transform along the last dimension without normalization."""
-    orig_shape = x.shape
+    original_shape = x.shape
     N = x.shape[-1]
-    N_padded = 2 ** int(np.ceil(np.log2(N))) if (N & (N - 1)) != 0 else N
-    pad_size = N_padded - N if N_padded != N else 0
+    # N_padded = 2 ** int(np.ceil(np.log2(N))) if (N & (N - 1)) != 0 else N
+    # pad_size = N_padded - N if N_padded != N else 0
 
-    if pad_size > 0:
-        x = F.pad(x, (0, pad_size))
+    # if pad_size > 0:
+    #     x = F.pad(x, (0, pad_size))
 
-    x = x.reshape(-1, N_padded)
+    x = x.reshape(-1, N)
     batch_dim, d = x.shape
-
     h = 2
     while h <= d:
-        hf = h >> 1
+        hf = h // 2
         x = x.view(batch_dim, d // h, h)
-        a = x[:, :, :hf]
-        b = x[:, :, hf:]
-        # In-place butterfly
-        tmp = a.clone()
-        a.add_(b)
-        b.mul_(-1).add_(tmp)
-        x = x.view(batch_dim, d)
-        h <<= 1
 
-    x = x.reshape(*orig_shape[:-1], N_padded)
-    if pad_size > 0:
-        x = x[..., :N]
+        half_1, half_2 = x[:, :, :hf], x[:, :, hf:]
 
-    return x
+        x = torch.cat((half_1 + half_2, half_1 - half_2), dim=-1)
+
+        h *= 2
+
+    return (x / np.sqrt(d)).view(*original_shape)
 
 
 
-class RHTQuantizedLinear(torch.nn.Linear):
-    def __init__(self, in_features, out_features, bias=True, weight_bits=8, activation_bits=8):
-        super(RHTQuantizedLinear, self).__init__(in_features, out_features, bias)
-        self.weight_bits = weight_bits
-        self.activation_bits = activation_bits
-        self.register_buffer('sign_vector', None)
-        self.N_padded = None  # Store padded size
+# class RHTQuantizedLinear(torch.nn.Linear):
+#     def __init__(self, in_features, out_features, bias=True, weight_bits=8, activation_bits=8):
+#         super(RHTQuantizedLinear, self).__init__(in_features, out_features, bias)
+#         self.weight_bits = weight_bits
+#         self.activation_bits = activation_bits
+#         self.register_buffer('sign_vector', None)
+#         self.N_padded = None  # Store padded size
 
-    def quantize_weight(self):
-        with torch.no_grad():
-            N = self.in_features
-            self.sign_vector = generate_random_sign_vector(N, self.weight.device, self.weight.dtype)
-            weight = self.weight.data  # Shape: [out_features, in_features]
+#     def quantize_weight(self):
+#         with torch.no_grad():
+#             N = self.in_features
+#             self.sign_vector = generate_random_sign_vector(N, self.weight.device, self.weight.dtype)
+#             weight = self.weight.data  # Shape: [out_features, in_features]
 
-            # Pad if necessary
-            N_padded = 2 ** int(np.ceil(np.log2(N))) if (N & (N - 1)) != 0 else N
-            self.N_padded = N_padded
-            pad_size = N_padded - N
+#             # Pad if necessary
+#             N_padded = 2 ** int(np.ceil(np.log2(N))) if (N & (N - 1)) != 0 else N
+#             self.N_padded = N_padded
+#             pad_size = N_padded - N
 
-            if pad_size > 0:
-                weight = F.pad(weight, (0, pad_size))  # Pad last dimension (input dimension)
-                sign_vector = F.pad(self.sign_vector, (0, pad_size), value=1)
-            else:
-                sign_vector = self.sign_vector
+#             if pad_size > 0:
+#                 weight = F.pad(weight, (0, pad_size))  # Pad last dimension (input dimension)
+#                 sign_vector = F.pad(self.sign_vector, (0, pad_size), value=1)
+#             else:
+#                 sign_vector = self.sign_vector
 
-            # Apply Hadamard transform to weights: W H
-            weight = fwht(weight)  # Apply FWHT along the last dimension (input dimension)
+#             # Apply Hadamard transform to weights: W H
+#             weight = fwht(weight)  # Apply FWHT along the last dimension (input dimension)
 
-            # Apply sign vector after FWHT
-            weight = weight * sign_vector.unsqueeze(0)
+#             # Apply sign vector after FWHT
+#             weight = weight * sign_vector.unsqueeze(0)
 
-            # Quantize and dequantize transformed weights (use signed quantization)
-            deq_weight = quantize_tensor_min_max(weight, self.weight_bits, signed=True)
+#             # Quantize and dequantize transformed weights (use signed quantization)
+#             deq_weight = quantize_tensor_min_max(weight, self.weight_bits, signed=True)
 
-            # Remove padding if necessary
-            if pad_size > 0:
-                deq_weight = deq_weight[:, :N]
+#             # Remove padding if necessary
+#             if pad_size > 0:
+#                 deq_weight = deq_weight[:, :N]
 
-            self.weight.data.copy_(deq_weight)
+#             self.weight.data.copy_(deq_weight)
 
-            # Quantize and dequantize bias if present
-            if self.bias is not None:
-                deq_b = quantize_tensor_min_max(self.bias.data, self.weight_bits, signed=True)
-                self.bias.data.copy_(deq_b)
+#             # Quantize and dequantize bias if present
+#             if self.bias is not None:
+#                 deq_b = quantize_tensor_min_max(self.bias.data, self.weight_bits, signed=True)
+#                 self.bias.data.copy_(deq_b)
 
-    def forward(self, input):
-        if self.sign_vector is None or self.N_padded is None:
-            raise ValueError("Weights not quantized. Call quantize_weight() before inference.")
+#     def forward(self, input):
+#         if self.sign_vector is None or self.N_padded is None:
+#             raise ValueError("Weights not quantized. Call quantize_weight() before inference.")
 
-        N = self.in_features
-        x = input  # Shape: [..., N]
-        pad_size = self.N_padded - N
+#         N = self.in_features
+#         x = input  # Shape: [..., N]
+#         pad_size = self.N_padded - N
 
-        if pad_size > 0:
-            x = F.pad(x, (0, pad_size))
-            sign_vector = F.pad(self.sign_vector, (0, pad_size), value=1)
-        else:
-            sign_vector = self.sign_vector
+#         if pad_size > 0:
+#             x = F.pad(x, (0, pad_size))
+#             sign_vector = F.pad(self.sign_vector, (0, pad_size), value=1)
+#         else:
+#             sign_vector = self.sign_vector
 
-        # Apply Hadamard transform to inputs: H x
-        x = fwht(x)
+#         # Apply Hadamard transform to inputs: H x
+#         x = fwht(x)
 
-        # Apply sign vector after FWHT
-        x = x * sign_vector
+#         # Apply sign vector after FWHT
+#         x = x * sign_vector
         
-        # Quantize and dequantize input (use signed quantization)
-        x = quantize_tensor_min_max(x, num_bits=self.activation_bits, signed=True)
+#         # Quantize and dequantize input (use signed quantization)
+#         x = quantize_tensor_min_max(x, num_bits=self.activation_bits, signed=True)
 
-        if pad_size > 0:
-            x = x[..., :N]
+#         if pad_size > 0:
+#             x = x[..., :N]
 
-        # Perform linear operation
-        output = F.linear(x, self.weight, self.bias)
+#         # Perform linear operation
+#         output = F.linear(x, self.weight, self.bias)
 
-        return output
+#         return output
 
 
 
-def replace_linear_with_rht_quantized_linear(model, weight_bits=8, activation_bits = 8):
-    for name, module in model.named_children():
-        if isinstance(module, torch.nn.Linear):
-            rht_linear = RHTQuantizedLinear(module.in_features, module.out_features, bias=module.bias is not None, weight_bits=weight_bits, activation_bits= activation_bits)
-            rht_linear.weight.data = module.weight.data.clone()
-            if module.bias is not None:
-                rht_linear.bias.data = module.bias.data.clone()
-            setattr(model, name, rht_linear)
-        else:
-            replace_linear_with_rht_quantized_linear(module, weight_bits, activation_bits)
+# def replace_linear_with_rht_quantized_linear(model, weight_bits=8, activation_bits = 8):
+#     for name, module in model.named_children():
+#         if isinstance(module, torch.nn.Linear):
+#             rht_linear = RHTQuantizedLinear(module.in_features, module.out_features, bias=module.bias is not None, weight_bits=weight_bits, activation_bits= activation_bits)
+#             rht_linear.weight.data = module.weight.data.clone()
+#             if module.bias is not None:
+#                 rht_linear.bias.data = module.bias.data.clone()
+#             setattr(model, name, rht_linear)
 
 # ===== Main Execution =====
 
@@ -586,7 +656,7 @@ if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("No GPUs found!")
         exit()
-    
+
     args, unknown = parser.parse_known_args()
 
     os.environ["USE_XFORMERS"] = '0' if args.disable_xformers else '1' # TODO: implement option to disable xformers
@@ -603,7 +673,7 @@ if __name__ == "__main__":
     #     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     # else:
     #     args.num_gpus = 1
-    
+
     args.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     args.accelerator = None
 
@@ -611,7 +681,7 @@ if __name__ == "__main__":
     configs = [OmegaConf.load(cfg) for cfg in args.config]
     cli = OmegaConf.from_dotlist(unknown)
     config = OmegaConf.merge(*configs, cli)
-    
+
     # update config from parsed arguments
     if args.train_samples is not None:
         config.data.params.train.params.dataset_size = args.train_samples
@@ -629,7 +699,7 @@ if __name__ == "__main__":
 
     # model
     print(f'\nCreating Stable Diffusion v2.1 model\n')
-    
+
     model = instantiate_from_config(config.model)
     model.learning_rate = base_lr
 
@@ -643,7 +713,7 @@ if __name__ == "__main__":
             print(f"  - {k}, {data.datasets[k].__class__.__name__}, {len(data.datasets[k])}")
     except:
         print("datasets not yet initialized.")
-    
+
     train_dataloader, val_dataloader, test_dataloader = data._train_dataloader(), data._val_dataloader(), data._test_dataloader()
 
     # load from checkpoint
@@ -682,7 +752,7 @@ if __name__ == "__main__":
         model = model.to(args.device)
     else:
         model = model.to(args.device)
-    
+
     if args.evaluate:
         iter_str = f' for {args.eval_samples} samples' if args.eval_samples is not None else ''
         print(f'\n\n\nEvaluating model on COCO validation dataset{iter_str}\n\n')
