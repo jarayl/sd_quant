@@ -243,22 +243,17 @@ def quantize_weights(model, args):
                     else:
                         sign_vector = sign_vector
                     
-                    # Apply Hadamard transform to weights: W H
-                    weight_prime = fwht(weight) * sign_vector
+                    # Apply Hadamard transform to weights: 
+                    weight_prime = fwht(weight * sign_vector)
 
-                    # deq_w = quantize_tensor_min_max(weight_prime, args.weight_quantize_bitwidth, signed=True)
-                    deq_w = weight_prime
+                    deq_w = quantize_tensor_min_max(weight_prime, args.weight_quantize_bitwidth, signed=True)
 
-                    # Unpad if needed
-                    if pad_size > 0:
-                        deq_w = deq_w[:, :N]
-
-                    module.weight.data.copy_(deq_w)
+                    module.weight.data = deq_w
 
                     # Quantize and dequantize bias if present
-                    # if module.bias is not None:
-                    #     deq_b = quantize_tensor_min_max(module.bias.data, args.weight_quantize_bitwidth, signed=True)
-                    #     module.bias.data.copy_(deq_b)
+                    if module.bias is not None:
+                        deq_b = quantize_tensor_min_max(module.bias.data, args.weight_quantize_bitwidth, signed=True)
+                        module.bias.data.copy_(deq_b)
                     
                     # Store sign_vector and padding info in the module
                     # We'll need this during activation quantization
@@ -372,11 +367,7 @@ def register_activation_quantization_hooks(model, args, activation_ranges=None):
         x = fwht(x * sign_vector)
         
         # Quantize activations
-        # x = quantize_tensor_min_max(x, num_bits=args.activation_quantize_bitwidth, signed=True)
-
-        # Remove padding if applied
-        if pad_size > 0:
-            x = x[..., :N]
+        x = quantize_tensor_min_max(x, num_bits=args.activation_quantize_bitwidth, signed=True)
 
         return (x,)
     
@@ -589,13 +580,10 @@ def fwht(x):
 #                 sign_vector = self.sign_vector
 
 #             # Apply Hadamard transform to weights: W H
-#             weight = fwht(weight)  # Apply FWHT along the last dimension (input dimension)
-
-#             # Apply sign vector after FWHT
-#             weight = weight * sign_vector.unsqueeze(0)
+#             weight = fwht(weight.t() * sign_vector).t()  # Apply FWHT along the last dimension (input dimension)
 
 #             # Quantize and dequantize transformed weights (use signed quantization)
-#             deq_weight = quantize_tensor_min_max(weight, self.weight_bits, signed=True)
+#             # deq_weight = quantize_tensor_min_max(weight, self.weight_bits, signed=True)
 
 #             # Remove padding if necessary
 #             if pad_size > 0:
@@ -623,19 +611,19 @@ def fwht(x):
 #             sign_vector = self.sign_vector
 
 #         # Apply Hadamard transform to inputs: H x
-#         x = fwht(x)
-
-#         # Apply sign vector after FWHT
-#         x = x * sign_vector
+#         x = fwht(x * sign_vector)
         
 #         # Quantize and dequantize input (use signed quantization)
-#         x = quantize_tensor_min_max(x, num_bits=self.activation_bits, signed=True)
+#         # x = quantize_tensor_min_max(x, num_bits=self.activation_bits, signed=True)
 
-#         if pad_size > 0:
-#             x = x[..., :N]
+#         # if pad_size > 0:
+#         #     x = x[..., :N]
 
 #         # Perform linear operation
-#         output = F.linear(x, self.weight, self.bias)
+#         output = x @ self.weight
+
+#         if self.bias is not None:
+#             output += self.bias
 
 #         return output
 
@@ -649,6 +637,8 @@ def fwht(x):
 #             if module.bias is not None:
 #                 rht_linear.bias.data = module.bias.data.clone()
 #             setattr(model, name, rht_linear)
+#         else:
+#             replace_linear_with_rht_quantized_linear(module, weight_bits, activation_bits)
 
 # ===== Main Execution =====
 
