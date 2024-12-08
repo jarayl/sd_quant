@@ -52,6 +52,7 @@ parser.add_argument('--print_freq', default=50, type=int, help='print every k ba
 parser.add_argument('--print_model', action='store_true', help='print model modules')
 parser.add_argument("--tag", default="", type=str, help="experiment identifier (string to prepend to save directory names")
 parser.add_argument('--activations', action='store_true', help='collect activation statistics')
+parser.add_argument('--kmean_quantize', action='store_true', help='use kmeans clusting to quantize weights of model')
 parser.add_argument('--dynamic_quantize', action='store_true', help='dynamic quantization of model')
 parser.add_argument('--static_quantize', action='store_true', help='static quantization of model')
 parser.add_argument('--weight_quantize_bitwidth', default=8, type=int, help='number of bits to quantize weights to (not activations)')
@@ -217,6 +218,72 @@ def evaluate_accuracy(model, dataloader=None, args=None):
 
     return test_acc
 
+############################
+# Added or Modified Code
+############################
+
+########################
+# Advanced Quantization: k-means
+########################
+
+def kmeans_clustering(values: torch.Tensor, K: int, num_iters=10):
+    """
+    Perform k-means clustering on 1D values to find K cluster centers.
+    values: [N] tensor
+    K: number of clusters
+    num_iters: iterations of k-means
+    
+    Returns:
+        centers: [K] cluster centers
+    """
+    values = values.view(-1)
+    # If all values are equal or K=1, shortcut
+    if values.numel() == 0:
+        return values
+
+    unique_vals = values.unique()
+    if unique_vals.numel() <= K:
+        # Already less unique values than K clusters
+        return unique_vals
+
+    # Initialize centers by random sampling
+    indices = torch.randperm(values.numel())[:K]
+    centers = values[indices].clone()
+
+    for _ in range(num_iters):
+        # Compute distances and assign clusters
+        # [N, K]
+        dist = (values.unsqueeze(1) - centers.unsqueeze(0))**2
+        cluster_ids = dist.argmin(dim=1)
+
+        # Update centers
+        for c in range(K):
+            mask = (cluster_ids == c)
+            if mask.any():
+                centers[c] = values[mask].mean()
+            else:
+                # If cluster empty, re-init from random point
+                idx = torch.randint(0, values.numel(), (1,))
+                centers[c] = values[idx]
+
+    # Sort centers for consistency
+    centers = centers.sort()[0]
+    return centers
+
+def kmeans_quantize(tensor: torch.Tensor, num_bits: int):
+    """
+    Quantize tensor using k-means codebook of size 2^num_bits.
+    """
+    K = 2**num_bits
+    flat = tensor.view(-1)
+    centers = kmeans_clustering(flat, K)
+    # Assign each value to nearest center
+    dist = (flat.unsqueeze(1) - centers.unsqueeze(0))**2
+    cluster_ids = dist.argmin(dim=1)
+    quantized_flat = centers[cluster_ids]
+    return quantized_flat.view_as(tensor)
+
+
 # ===== Main Quantization Functions =====
 
 def quantize_weights(model, args):
@@ -246,7 +313,11 @@ def quantize_weights(model, args):
                     # Apply Hadamard transform to weights: 
                     weight_prime = fwht(weight * sign_vector)
 
-                    deq_w = quantize_tensor_min_max(weight_prime, args.weight_quantize_bitwidth, signed=True)
+                    if args.kmean_quantize:
+                        print("Using kmeans clusting to quantize weights")
+                        deq_w = kmeans_quantize(weight_prime, args.weight_quantize_bitwidth)
+                    else:
+                        deq_w = quantize_tensor_min_max(weight_prime, args.weight_quantize_bitwidth, signed=True)
 
                     module.weight.data = deq_w
 
@@ -259,7 +330,6 @@ def quantize_weights(model, args):
                     # We'll need this during activation quantization
                     module.register_buffer('rht_sign_vector', sign_vector)
                     module.rht_N_padded = N_padded
-
     else:
         print(f"Applying {'dynamic' if args.dynamic_quantize else 'static'} quantization (W{args.weight_quantize_bitwidth} bits) to the model's Linear and Conv2d layers...")
         for name, module in model.named_modules():
@@ -552,93 +622,6 @@ def fwht(x):
 
     return (x / np.sqrt(d)).view(*original_shape)
 
-
-
-# class RHTQuantizedLinear(torch.nn.Linear):
-#     def __init__(self, in_features, out_features, bias=True, weight_bits=8, activation_bits=8):
-#         super(RHTQuantizedLinear, self).__init__(in_features, out_features, bias)
-#         self.weight_bits = weight_bits
-#         self.activation_bits = activation_bits
-#         self.register_buffer('sign_vector', None)
-#         self.N_padded = None  # Store padded size
-
-#     def quantize_weight(self):
-#         with torch.no_grad():
-#             N = self.in_features
-#             self.sign_vector = generate_random_sign_vector(N, self.weight.device, self.weight.dtype)
-#             weight = self.weight.data  # Shape: [out_features, in_features]
-
-#             # Pad if necessary
-#             N_padded = 2 ** int(np.ceil(np.log2(N))) if (N & (N - 1)) != 0 else N
-#             self.N_padded = N_padded
-#             pad_size = N_padded - N
-
-#             if pad_size > 0:
-#                 weight = F.pad(weight, (0, pad_size))  # Pad last dimension (input dimension)
-#                 sign_vector = F.pad(self.sign_vector, (0, pad_size), value=1)
-#             else:
-#                 sign_vector = self.sign_vector
-
-#             # Apply Hadamard transform to weights: W H
-#             weight = fwht(weight.t() * sign_vector).t()  # Apply FWHT along the last dimension (input dimension)
-
-#             # Quantize and dequantize transformed weights (use signed quantization)
-#             # deq_weight = quantize_tensor_min_max(weight, self.weight_bits, signed=True)
-
-#             # Remove padding if necessary
-#             if pad_size > 0:
-#                 deq_weight = deq_weight[:, :N]
-
-#             self.weight.data.copy_(deq_weight)
-
-#             # Quantize and dequantize bias if present
-#             if self.bias is not None:
-#                 deq_b = quantize_tensor_min_max(self.bias.data, self.weight_bits, signed=True)
-#                 self.bias.data.copy_(deq_b)
-
-#     def forward(self, input):
-#         if self.sign_vector is None or self.N_padded is None:
-#             raise ValueError("Weights not quantized. Call quantize_weight() before inference.")
-
-#         N = self.in_features
-#         x = input  # Shape: [..., N]
-#         pad_size = self.N_padded - N
-
-#         if pad_size > 0:
-#             x = F.pad(x, (0, pad_size))
-#             sign_vector = F.pad(self.sign_vector, (0, pad_size), value=1)
-#         else:
-#             sign_vector = self.sign_vector
-
-#         # Apply Hadamard transform to inputs: H x
-#         x = fwht(x * sign_vector)
-        
-#         # Quantize and dequantize input (use signed quantization)
-#         # x = quantize_tensor_min_max(x, num_bits=self.activation_bits, signed=True)
-
-#         # if pad_size > 0:
-#         #     x = x[..., :N]
-
-#         # Perform linear operation
-#         output = x @ self.weight
-
-#         if self.bias is not None:
-#             output += self.bias
-
-#         return output
-
-
-
-# def replace_linear_with_rht_quantized_linear(model, weight_bits=8, activation_bits = 8):
-#     for name, module in model.named_children():
-#         if isinstance(module, torch.nn.Linear):
-#             rht_linear = RHTQuantizedLinear(module.in_features, module.out_features, bias=module.bias is not None, weight_bits=weight_bits, activation_bits= activation_bits)
-#             rht_linear.weight.data = module.weight.data.clone()
-#             if module.bias is not None:
-#                 rht_linear.bias.data = module.bias.data.clone()
-#             setattr(model, name, rht_linear)
-#         else:
-#             replace_linear_with_rht_quantized_linear(module, weight_bits, activation_bits)
 
 # ===== Main Execution =====
 
