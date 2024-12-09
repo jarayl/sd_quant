@@ -53,6 +53,8 @@ parser.add_argument('--print_model', action='store_true', help='print model modu
 parser.add_argument("--tag", default="", type=str, help="experiment identifier (string to prepend to save directory names")
 parser.add_argument('--activations', action='store_true', help='collect activation statistics')
 parser.add_argument('--kmean_quantize', action='store_true', help='use kmeans clusting to quantize weights of model')
+parser.add_argument('--gaussian_quantize', action='store_true', help='use gaussian specific quantization for weights of model')
+parser.add_argument('--norm_before_quantize', action='store_true', help='normalize before quantizing')
 parser.add_argument('--dynamic_quantize', action='store_true', help='dynamic quantization of model')
 parser.add_argument('--static_quantize', action='store_true', help='static quantization of model')
 parser.add_argument('--weight_quantize_bitwidth', default=8, type=int, help='number of bits to quantize weights to (not activations)')
@@ -218,10 +220,6 @@ def evaluate_accuracy(model, dataloader=None, args=None):
 
     return test_acc
 
-############################
-# Added or Modified Code
-############################
-
 ########################
 # Advanced Quantization: k-means
 ########################
@@ -284,6 +282,53 @@ def kmeans_quantize(tensor: torch.Tensor, num_bits: int):
     return quantized_flat.view_as(tensor)
 
 
+def gaussian_quantize(tensor: torch.Tensor, num_bits: int):
+    """
+    Quantize `tensor` using a Gaussian-based codebook approach.
+    1. Compute mean and std of the data.
+    2. Determine codebook by partitioning the Gaussian distribution.
+    3. Map each value to the nearest centroid.
+    """
+    K = 2 ** num_bits
+    flat = tensor.view(-1)
+    mean = flat.mean()
+    std = flat.std() + 1e-8  # avoid div-by-zero
+
+    # If all values are nearly identical
+    if std < 1e-12:
+        return torch.full_like(tensor, mean), mean.unsqueeze(0)
+
+    # Compute codebook by quantile
+    # The inverse CDF of standard normal can be approximated by torch.special.erfinv or define your own
+    # For simplicity, use a numerical approximation:
+    def normal_icdf(p):
+        # approximate inverse CDF for standard normal using torch.erfinv
+        # CDF(x) = 0.5*(1+erf(x/sqrt(2)))
+        # p = 0.5*(1+erf(x/sqrt(2))) => erf(x/sqrt(2)) = 2p-1
+        # x = sqrt(2)*erfinv(2p-1)
+        return np.sqrt(2) * torch.erfinv(torch.tensor(2*p-1, device=flat.device))
+
+    # Compute codebook centers
+    # We want equally spaced quantiles in [0,1], so:
+    # q_k = (k - 0.5)/K for k=1,...,K
+    codebook = []
+    for k in range(1, K+1):
+        q = (k - 0.5)/K
+        z = normal_icdf(q)
+        c = mean + std * z
+        codebook.append(c)
+    codebook = torch.stack(codebook)  # [K]
+
+    # Assign each value to the nearest codebook center
+    # One approach: sorting codebook and binary searching, 
+    # but we can do directly by distance since K might not be huge
+    # For large K, consider a more efficient search
+    dist = (flat.unsqueeze(1) - codebook.unsqueeze(0))**2
+    cluster_ids = dist.argmin(dim=1)
+    quantized_flat = codebook[cluster_ids]
+    return quantized_flat.view_as(tensor)
+
+
 # ===== Main Quantization Functions =====
 
 def quantize_weights(model, args):
@@ -312,11 +357,30 @@ def quantize_weights(model, args):
                     
                     # Apply Hadamard transform to weights: 
                     weight_prime = fwht(weight * sign_vector)
+                    
+                    if args.norm_before_quantize:
+                        print ("Normalizing RHT transformed weights")
+                        # Normalization Step:
+                        # Compute mean and std
+                        mean = weight_prime.mean()
+                        std = weight_prime.std(unbiased=False)
+                        if std < 1e-8:
+                            # If std is tiny, fallback: just quantize directly
+                            # or treat all weights as a constant
+                            std = 1.0
+
+                        # Normalize: (W - mean) / std
+                        # You can also skip mean subtraction if you prefer.
+                        weight_prime = (weight_prime - mean) / std
 
                     if args.kmean_quantize:
                         print("Using kmeans clusting to quantize weights")
                         deq_w = kmeans_quantize(weight_prime, args.weight_quantize_bitwidth)
+                    elif args.gaussian_quantize:
+                        print("Using gaussian codebook to quantize weights")
+                        deq_w = gaussian_quantize(weight_prime, args.weight_quantize_bitwidth)
                     else:
+                        print ("Using standard minmax quantzation for weights")
                         deq_w = quantize_tensor_min_max(weight_prime, args.weight_quantize_bitwidth, signed=True)
 
                     module.weight.data = deq_w
@@ -435,7 +499,21 @@ def register_activation_quantization_hooks(model, args, activation_ranges=None):
 
         # Apply Hadamard transform
         x = fwht(x * sign_vector)
-        
+
+        if args.norm_before_quantize:
+            print ("Normalizing RHT transformed activations")
+            # Normalization Step:
+            # Compute mean and std
+            mean = x.mean()
+            std = x.std(unbiased=False)
+            if std < 1e-8:
+                # If std is tiny, fallback: just quantize directly
+                # or treat all weights as a constant
+                std = 1.0
+
+            # Normalize: (X - mean) / std
+            x = (x - mean) / std
+
         # Quantize activations
         x = quantize_tensor_min_max(x, num_bits=args.activation_quantize_bitwidth, signed=True)
 
