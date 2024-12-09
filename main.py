@@ -20,13 +20,13 @@ import torch.backends.cudnn as cudnn
 import torchvision
 from torch.utils.tensorboard import SummaryWriter
 import pytorch_lightning as pl
+import torch.nn.functional as F
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.data.coco import CocoImagesAndCaptionsTrain2017, CocoImagesAndCaptionsValidation2017
 from ldm.util import instantiate_from_config, str_or_int
 from ldm.eval.clip_score import CLIPScore
 from ldm.eval.fid_score import FrechetInceptionDistance
-        
 
 parser = argparse.ArgumentParser()
 
@@ -52,16 +52,16 @@ parser.add_argument('--print_freq', default=50, type=int, help='print every k ba
 parser.add_argument('--print_model', action='store_true', help='print model modules')
 parser.add_argument("--tag", default="", type=str, help="experiment identifier (string to prepend to save directory names")
 parser.add_argument('--activations', action='store_true', help='collect activation statistics')
+parser.add_argument('--kmean_quantize', action='store_true', help='use kmeans clusting to quantize weights of model')
 parser.add_argument('--dynamic_quantize', action='store_true', help='dynamic quantization of model')
 parser.add_argument('--static_quantize', action='store_true', help='static quantization of model')
-parser.add_argument('--quantize_bitwidth', default=8, type=int, help='number of bits to quantize weights to (not activations)')
-
-
+parser.add_argument('--weight_quantize_bitwidth', default=8, type=int, help='number of bits to quantize weights to (not activations)')
+parser.add_argument('--activation_quantize_bitwidth', default=8, type=int, help='number of bits to quantize activations to (not weights)')
+parser.add_argument('--rht_quant', action='store_true', help='Quantize with Random Hadamard Transform')
 
 def get_experiment_str(args):
     experiment_str = args.tag + '_' + datetime.now().strftime('%Y-%m-%d_%H-%M/')
     return experiment_str
-
 
 class WrappedDataset(Dataset):
     """Wraps an arbitrary object with __len__ and __getitem__ into a pytorch dataset"""
@@ -74,7 +74,6 @@ class WrappedDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.data[idx]
-
 
 def worker_init_fn(_):
     worker_info = torch.utils.data.get_worker_info()
@@ -90,7 +89,6 @@ def worker_init_fn(_):
         return np.random.seed(np.random.get_state()[1][current_id] + worker_id)
     else:
         return np.random.seed(np.random.get_state()[1][0] + worker_id)
-
 
 class DataModuleFromConfig(pl.LightningDataModule):
     def __init__(self, batch_size, train=None, validation=None, test=None, predict=None,
@@ -169,12 +167,10 @@ class DataModuleFromConfig(pl.LightningDataModule):
         return DataLoader(self.datasets["predict"], batch_size=self.batch_size,
                           num_workers=self.num_workers, worker_init_fn=init_fn)
 
-
 def evaluate_accuracy(model, dataloader=None, args=None):
-    print (args.activations)
     model.eval()
     save_dir = f'./results/{args.experiment_str}/'
-    
+
     if args.monitor_fid:
         acc_metric = FrechetInceptionDistance().set_dtype(torch.float64).to(args.device)
     else:
@@ -186,18 +182,20 @@ def evaluate_accuracy(model, dataloader=None, args=None):
 
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
+            print(f"batch {i} \n")
             # check if we want to plot this batch
             plot = args.plot and (i < 20)
             activations = args.activations
-            
+
             batch[model.first_stage_key] = batch[model.first_stage_key].to(args.device)
             samples, images, prompts = model.sample_images(batch, batch_idx=i, epoch=None, save_dir=save_dir, plot=plot, activations = activations)
 
             if (plot and args.plot_only) or activations:
                 exit()
-            
+
             # save the first 10 images, and then save one image every 100 iterations
             if args.evaluate and args.save_images and (args.accelerator is None or args.accelerator.is_main_process) and (i < 10 or i % 100 == 0):
+                print("saving image")
                 filename = f"{i:05}.png"
                 path = os.path.join(images_dir, filename)
                 sample = rearrange(samples[0].detach().cpu().numpy(), 'c h w -> h w c')
@@ -217,15 +215,421 @@ def evaluate_accuracy(model, dataloader=None, args=None):
                 print(f'\tbatch {i}/{len(dataloader)}: test acc {acc_so_far:.2f}')
 
     test_acc = acc_metric.compute().detach().cpu().numpy()
-    
+
     return test_acc
 
+############################
+# Added or Modified Code
+############################
+
+########################
+# Advanced Quantization: k-means
+########################
+
+def kmeans_clustering(values: torch.Tensor, K: int, num_iters=10):
+    """
+    Perform k-means clustering on 1D values to find K cluster centers.
+    values: [N] tensor
+    K: number of clusters
+    num_iters: iterations of k-means
+    
+    Returns:
+        centers: [K] cluster centers
+    """
+    values = values.view(-1)
+    # If all values are equal or K=1, shortcut
+    if values.numel() == 0:
+        return values
+
+    unique_vals = values.unique()
+    if unique_vals.numel() <= K:
+        # Already less unique values than K clusters
+        return unique_vals
+
+    # Initialize centers by random sampling
+    indices = torch.randperm(values.numel())[:K]
+    centers = values[indices].clone()
+
+    for _ in range(num_iters):
+        # Compute distances and assign clusters
+        # [N, K]
+        dist = (values.unsqueeze(1) - centers.unsqueeze(0))**2
+        cluster_ids = dist.argmin(dim=1)
+
+        # Update centers
+        for c in range(K):
+            mask = (cluster_ids == c)
+            if mask.any():
+                centers[c] = values[mask].mean()
+            else:
+                # If cluster empty, re-init from random point
+                idx = torch.randint(0, values.numel(), (1,))
+                centers[c] = values[idx]
+
+    # Sort centers for consistency
+    centers = centers.sort()[0]
+    return centers
+
+def kmeans_quantize(tensor: torch.Tensor, num_bits: int):
+    """
+    Quantize tensor using k-means codebook of size 2^num_bits.
+    """
+    K = 2**num_bits
+    flat = tensor.view(-1)
+    centers = kmeans_clustering(flat, K)
+    # Assign each value to nearest center
+    dist = (flat.unsqueeze(1) - centers.unsqueeze(0))**2
+    cluster_ids = dist.argmin(dim=1)
+    quantized_flat = centers[cluster_ids]
+    return quantized_flat.view_as(tensor)
+
+
+# ===== Main Quantization Functions =====
+
+def quantize_weights(model, args):
+    if args.rht_quant:
+        print(f"Applying RHT quantization (W{args.weight_quantize_bitwidth}A{args.activation_quantize_bitwidth} bits) to the model's Linear layers...")
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                with torch.no_grad():
+                    # Quantize and dequantize weights
+                    N = module.in_features
+                    
+                    sign_vector = generate_random_sign_vector(N, module.weight.device, module.weight.dtype)
+                    
+                    weight = module.weight.data  # Shape: [out_features, in_features]
+
+                    # Pad if necessary
+                    N_padded = 2 ** int(np.ceil(np.log2(N))) if (N & (N - 1)) != 0 else N
+                    N_padded = N_padded
+                    pad_size = N_padded - N
+
+                    if pad_size > 0:
+                        weight = F.pad(weight, (0, pad_size))  # Pad last dimension (input dimension)
+                        sign_vector = F.pad(sign_vector, (0, pad_size), value=1)
+                    else:
+                        sign_vector = sign_vector
+                    
+                    # Apply Hadamard transform to weights: 
+                    weight_prime = fwht(weight * sign_vector)
+
+                    if args.kmean_quantize:
+                        print("Using kmeans clusting to quantize weights")
+                        deq_w = kmeans_quantize(weight_prime, args.weight_quantize_bitwidth)
+                    else:
+                        deq_w = quantize_tensor_min_max(weight_prime, args.weight_quantize_bitwidth, signed=True)
+
+                    module.weight.data = deq_w
+
+                    # Quantize and dequantize bias if present
+                    if module.bias is not None:
+                        deq_b = quantize_tensor_min_max(module.bias.data, args.weight_quantize_bitwidth, signed=True)
+                        module.bias.data.copy_(deq_b)
+                    
+                    # Store sign_vector and padding info in the module
+                    # We'll need this during activation quantization
+                    module.register_buffer('rht_sign_vector', sign_vector)
+                    module.rht_N_padded = N_padded
+    else:
+        print(f"Applying {'dynamic' if args.dynamic_quantize else 'static'} quantization (W{args.weight_quantize_bitwidth} bits) to the model's Linear and Conv2d layers...")
+        for name, module in model.named_modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                with torch.no_grad():
+                    # Quantize and dequantize weights
+                    deq_w = quantize_tensor_min_max(module.weight.data, args.weight_quantize_bitwidth, signed=True)
+                    module.weight.data.copy_(deq_w)
+
+                    # Quantize and dequantize bias if present
+                    if module.bias is not None:
+                        deq_b = quantize_tensor_min_max(module.bias.data, args.weight_quantize_bitwidth, signed=True)
+                        module.bias.data.copy_(deq_b)
+
+def quantize_activations(model, args, activation_ranges=None):
+    """
+    Main activation quantization function that handles different quantization modes.
+    """
+    if args.rht_quant:
+        print(f"Applying RHT incoherence processing and dynamic activation quantization (A{args.activation_quantize_bitwidth} bits)...")
+        register_activation_quantization_hooks(model, args, activation_ranges=None)
+    else:
+        if args.dynamic_quantize:
+            print(f"Applying dynamic activation quantization (A{args.activation_quantize_bitwidth} bits)...")
+            register_activation_quantization_hooks(model, args, activation_ranges=None)
+        elif args.static_quantize:
+            print(f"Applying static activation quantization (A{args.activation_quantize_bitwidth} bits)...")
+            if activation_ranges is None:
+                raise ValueError("Activation ranges must be provided for static quantization.")
+            register_activation_quantization_hooks(model, args, activation_ranges)
+        else:
+            pass  # No activation quantization
+
+# ===== Helper Functions =====
+
+def quantize_tensor_min_max(tensor, num_bits=8, signed=True):
+    if signed:
+        qmin = - (2 ** (num_bits - 1))
+        qmax = (2 ** (num_bits - 1)) - 1
+        zero_point = 0
+        max_abs = tensor.abs().max()
+        if max_abs == 0:
+            scale = 1.0
+        else:
+            scale = max_abs / qmax
+    else:
+        qmin = 0
+        qmax = (2 ** num_bits) - 1
+        min_val = tensor.min()
+        max_val = tensor.max()
+        if min_val == max_val:
+            scale = 1.0
+            zero_point = 0
+        else:
+            scale = (max_val - min_val) / (qmax - qmin)
+            zero_point = qmin - min_val / scale
+
+    # Quantize
+    q_x = ((tensor / scale) + zero_point).round().clamp(qmin, qmax)
+
+    # Dequantize
+    deq_x = (q_x - zero_point) * scale
+
+    return deq_x
+
+
+def quantize_and_dequantize_tensor(tensor, scale, zero_point, qmin, qmax):
+    """
+    Quantizes and immediately dequantizes a tensor using provided scale and zero_point.
+    """
+    q_x = ((tensor / scale) + zero_point).round().clamp(qmin, qmax)
+    deq_x = (q_x - zero_point) * scale
+    return deq_x
+
+def register_activation_quantization_hooks(model, args, activation_ranges=None):
+    """
+    Register activation quantization hooks for dynamic or static quantization.
+    """
+    module_to_name = {}
+    handles = []
+
+    # Build module_to_name mapping
+    for name, module in model.named_modules():
+        module_to_name[module] = name
+
+    def rht_activation_pre_hook(module, input):
+        # This pre-hook transforms the input activations using the RHT logic
+        # only if rht_sign_vector exists in the module.
+        if not hasattr(module, 'rht_sign_vector'):
+            print("FUCK")
+            return input
+        
+        x = input[0]
+        N = module.in_features
+    
+        sign_vector = module.rht_sign_vector
+        N_padded = module.rht_N_padded
+        pad_size = N_padded - N
+
+        # Pad input if needed
+        if pad_size > 0:
+            x = F.pad(x, (0, pad_size))
+
+        # Apply Hadamard transform
+        x = fwht(x * sign_vector)
+        
+        # Quantize activations
+        x = quantize_tensor_min_max(x, num_bits=args.activation_quantize_bitwidth, signed=True)
+
+        return (x,)
+    
+    # Define hook for activation quantization
+    def activation_quantization_hook(module, input, output):
+        module_name = module_to_name[module]
+
+        if args.dynamic_quantize:
+            deq_x = quantize_tensor_min_max(output, num_bits=args.activation_quantize_bitwidth, signed=False)
+            return deq_x
+        elif args.static_quantize:
+            # Retrieve quantization parameters
+            params = activation_ranges.get(module_name, None)
+            if params is None:
+                return output
+
+            scale = params['scale']
+            zero_point = params['zero_point']
+            qmin = params['qmin']
+            qmax = params['qmax']
+
+            deq_x = quantize_and_dequantize_tensor(output, scale, zero_point, qmin, qmax)
+            return deq_x
+        else:
+            return output
+
+    # Register hooks for specific layer types
+    if args.rht_quant:
+        print("Registering RHT hooks for linear layers...")
+        # For RHT, we do a forward_pre_hook to handle input transformations before the linear layer
+        for name, module in model.named_modules():
+            if isinstance(module, torch.nn.Linear):
+                # Add forward pre-hook for RHT transform
+                handle = module.register_forward_pre_hook(rht_activation_pre_hook)
+                handles.append(handle)
+    else:
+        print ("Registering hooks for normal dynamic/static quantization...")
+        for name, module in model.named_modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                handle = module.register_forward_hook(activation_quantization_hook)
+                handles.append(handle)
+
+    return handles
+
+def collect_activation_ranges(model, dataloader, num_batches, args):
+    activation_ranges = {}
+    module_to_name = {}
+    handles = []
+
+    # Build module_to_name mapping
+    for name, module in model.named_modules():
+        module_to_name[module] = name
+
+    # Define hook to collect activation ranges
+    def collect_activation_ranges_hook(module, input, output):
+        module_name = module_to_name[module]
+
+        # Handle tensor output
+        if isinstance(output, torch.Tensor):
+            min_val = output.min().item()
+            max_val = output.max().item()
+            if module_name not in activation_ranges:
+                activation_ranges[module_name] = {'min': min_val, 'max': max_val}
+            else:
+                activation_ranges[module_name]['min'] = min(activation_ranges[module_name]['min'], min_val)
+                activation_ranges[module_name]['max'] = max(activation_ranges[module_name]['max'], max_val)
+
+    # Register hooks
+    for name, module in model.named_modules():
+        if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)):
+            handle = module.register_forward_hook(collect_activation_ranges_hook)
+            handles.append(handle)
+
+    # Run calibration
+    model.eval()
+    with torch.no_grad():
+        for i, batch in enumerate(dataloader):
+            if i >= num_batches:
+                break
+
+            try:
+                # Get x_start and ensure it's in NCHW format
+                x_start = batch[model.first_stage_key].to(args.device)
+                if x_start.ndim == 4 and x_start.shape[1] != 3 and x_start.shape[3] == 3:
+                    # Convert from NHWC to NCHW
+                    x_start = x_start.permute(0, 3, 1, 2)
+                elif x_start.ndim == 3 and x_start.shape[2] == 3:
+                    # Handle case where batch dimension is missing
+                    x_start = x_start.permute(2, 0, 1).unsqueeze(0)
+                elif x_start.ndim != 4:
+                    print(f"Unexpected x_start shape: {x_start.shape}")
+                    continue
+
+                # Encode x_start
+                x_start = model.get_first_stage_encoding(model.encode_first_stage(x_start))
+
+                # Prepare conditioning
+                prompts = batch['caption']
+                conditioning = model.get_learned_conditioning(prompts)
+
+                # Generate noise
+                noise = torch.randn_like(x_start)
+
+                # Get timesteps
+                t = torch.randint(0, model.num_timesteps, (x_start.shape[0],), device=args.device).long()
+
+                # Add noise to x_start to get x_noisy
+                x_noisy = model.q_sample(x_start=x_start, t=t, noise=noise)
+
+                # Apply model to get noise_pred
+                noise_pred = model.apply_model(x_noisy, t, conditioning)
+
+            except Exception as e:
+                print(f"Error processing batch {i}: {e}")
+                continue
+
+    # Remove hooks
+    for handle in handles:
+        handle.remove()
+
+    return activation_ranges
+
+def compute_quantization_parameters(activation_ranges, num_bits):
+    """
+    Compute quantization parameters using standard uniform quantization for each module
+    """
+    quantization_params = {}
+    qmin = 0
+    qmax = 2 ** num_bits - 1
+
+    for module_name, ranges in activation_ranges.items():
+        min_val = ranges['min']
+        max_val = ranges['max']
+
+        # Compute scale
+        act_range = max_val - min_val
+        if act_range == 0:
+            scale = 1.0
+            zero_point = 0
+        else:
+            scale = act_range / (qmax - qmin)
+            zero_point = qmin - min_val / scale
+            zero_point = np.clip(zero_point, qmin, qmax)
+
+        quantization_params[module_name] = {
+            'scale': float(scale),
+            'zero_point': int(zero_point),
+            'qmin': qmin,
+            'qmax': qmax
+        }
+
+    return quantization_params
+
+# ===== Random Hadamard Transform Functions =====
+
+def generate_random_sign_vector(length, device, dtype):
+    """Generate a random sign vector (+1 or -1) of given length."""
+    return torch.randint(0, 2, (length,), device=device, dtype=dtype) * 2 - 1  # Random +/-1
+
+def fwht(x):
+    """Fast Walsh-Hadamard Transform along the last dimension without normalization."""
+    original_shape = x.shape
+    N = x.shape[-1]
+    # N_padded = 2 ** int(np.ceil(np.log2(N))) if (N & (N - 1)) != 0 else N
+    # pad_size = N_padded - N if N_padded != N else 0
+
+    # if pad_size > 0:
+    #     x = F.pad(x, (0, pad_size))
+
+    x = x.reshape(-1, N)
+    batch_dim, d = x.shape
+    h = 2
+    while h <= d:
+        hf = h // 2
+        x = x.view(batch_dim, d // h, h)
+
+        half_1, half_2 = x[:, :, :hf], x[:, :, hf:]
+
+        x = torch.cat((half_1 + half_2, half_1 - half_2), dim=-1)
+
+        h *= 2
+
+    return (x / np.sqrt(d)).view(*original_shape)
+
+
+# ===== Main Execution =====
 
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("No GPUs found!")
         exit()
-    
+
     args, unknown = parser.parse_known_args()
 
     os.environ["USE_XFORMERS"] = '0' if args.disable_xformers else '1' # TODO: implement option to disable xformers
@@ -242,7 +646,7 @@ if __name__ == "__main__":
     #     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     # else:
     #     args.num_gpus = 1
-    
+
     args.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     args.accelerator = None
 
@@ -250,7 +654,7 @@ if __name__ == "__main__":
     configs = [OmegaConf.load(cfg) for cfg in args.config]
     cli = OmegaConf.from_dotlist(unknown)
     config = OmegaConf.merge(*configs, cli)
-    
+
     # update config from parsed arguments
     if args.train_samples is not None:
         config.data.params.train.params.dataset_size = args.train_samples
@@ -268,7 +672,7 @@ if __name__ == "__main__":
 
     # model
     print(f'\nCreating Stable Diffusion v2.1 model\n')
-    
+
     model = instantiate_from_config(config.model)
     model.learning_rate = base_lr
 
@@ -282,65 +686,9 @@ if __name__ == "__main__":
             print(f"  - {k}, {data.datasets[k].__class__.__name__}, {len(data.datasets[k])}")
     except:
         print("datasets not yet initialized.")
-    
+
     train_dataloader, val_dataloader, test_dataloader = data._train_dataloader(), data._val_dataloader(), data._test_dataloader()
 
-    # TODO: quantization
-
-    def quantize_weight(tensor, num_bits=8):
-        qmin = -(2 ** (num_bits - 1))
-        qmax = (2 ** (num_bits - 1)) - 1
-
-        max_val = tensor.abs().max()
-        if max_val == 0:
-            scale = 1.0
-        else:
-            scale = max_val / qmax
-
-        # Quantize
-        q_x = (tensor / scale).round().clamp(qmin, qmax)
-        # Dequantize
-        dq_x = q_x * scale
-
-        return dq_x
-
-    def quantize_model_weights(model, num_bits=8):
-        for name, module in model.named_modules():
-            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-                with torch.no_grad():
-                    module.weight.data = quantize_weight(module.weight.data, num_bits)
-                    if module.bias is not None:
-                        module.bias.data = quantize_weight(module.bias.data, num_bits)
-
-    def quantize_activation(tensor, num_bits=8):
-        qmin = 0
-        qmax = (2 ** num_bits) - 1
-
-        min_val = tensor.min()
-        max_val = tensor.max()
-        if min_val == max_val:
-            scale = 1.0
-            zero_point = 0
-        else:
-            scale = (max_val - min_val) / (qmax - qmin)
-            zero_point = qmin - min_val / scale
-
-        # Quantize
-        q_x = ((tensor / scale) + zero_point).round().clamp(qmin, qmax)
-        # Dequantize
-        dq_x = (q_x - zero_point) * scale
-
-        return dq_x
-
-    def activation_quantization_hook(module, input, output):
-        return quantize_activation(output, num_bits=8)
-
-    def register_activation_quantization_hooks(model):
-        for name, module in model.named_modules():
-            if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
-                module.register_forward_hook(activation_quantization_hook)
-
-    
     # load from checkpoint
     if args.checkpoint is None or not os.path.isfile(args.checkpoint):
         print("\nNo checkpoint found! Proceeding without checkpoint.")
@@ -361,23 +709,22 @@ if __name__ == "__main__":
 
     args.calibrating_range = False # this tells DDIM sampler when to print clip_vals
     model.args = args
-    
-    # if args.accelerate:
-    #     model, train_dataloader, val_dataloader, test_dataloader = args.accelerator.prepare(model, train_dataloader, val_dataloader, test_dataloader)
-    #     args.train_dataloader_len = len(train_dataloader)
-    #     args.val_dataloader_len = len(val_dataloader)
-    #     args.test_dataloader_len = len(test_dataloader)
 
     # Apply quantization before moving the model to GPU
-    if args.dynamic_quantize:
-        print(f"Applying dynamic {args.quantize_bitwidth}-bit quantization (W{args.quantize_bitwidth}A8) to the model's Linear and Conv2d layers...")
-        quantize_model_weights(model.model, num_bits=args.quantize_bitwidth)
-        register_activation_quantization_hooks(model.model)
-    elif args.static_quantize:
-        print(f"Applying static {args.quantize_bitwidth}-bit quantization (W{args.quantize_bitwidth}A8) to the model's Linear and Conv2d layers...")
-
-
-    model = model.to(args.device)
+    if args.static_quantize:
+        model = model.to(args.device)
+        num_calibration_batches = 10
+        print(f"Collecting activation ranges for static quantization using {num_calibration_batches} batches...")
+        activation_ranges = collect_activation_ranges(model, train_dataloader, num_calibration_batches, args)
+        quantization_params = compute_quantization_parameters(activation_ranges, args.activation_quantize_bitwidth)
+        quantize_weights(model.model, args)
+        quantize_activations(model.model, args, activation_ranges=quantization_params)
+    elif args.dynamic_quantize:
+        quantize_weights(model.model, args)
+        quantize_activations(model.model, args)
+        model = model.to(args.device)
+    else:
+        model = model.to(args.device)
 
     if args.evaluate:
         iter_str = f' for {args.eval_samples} samples' if args.eval_samples is not None else ''
