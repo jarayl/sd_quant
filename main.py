@@ -221,7 +221,7 @@ def evaluate_accuracy(model, dataloader=None, args=None):
     return test_acc
 
 ########################
-# Advanced Quantization: k-means
+# Additional Quantization: k-means codebook and gaussian codebook 
 ########################
 
 def kmeans_clustering(values: torch.Tensor, K: int, num_iters=10):
@@ -329,15 +329,19 @@ def gaussian_quantize(tensor: torch.Tensor, num_bits: int):
     return quantized_flat.view_as(tensor)
 
 
-# ===== Main Quantization Functions =====
-
+########################
+# Main Quantization Functions
+########################
 def quantize_weights(model, args):
+    """
+    Main weight quantization function that handles different quantization modes.
+    """
     if args.rht_quant:
         print(f"Applying RHT quantization (W{args.weight_quantize_bitwidth}A{args.activation_quantize_bitwidth} bits) to the model's Linear layers...")
         for name, module in model.named_modules():
             if isinstance(module, torch.nn.Linear):
                 with torch.no_grad():
-                    # Quantize and dequantize weights
+                    # Apply random hadamard rotation and quantize weights
                     N = module.in_features
                     
                     sign_vector = generate_random_sign_vector(N, module.weight.device, module.weight.dtype)
@@ -370,7 +374,6 @@ def quantize_weights(model, args):
                             std = 1.0
 
                         # Normalize: (W - mean) / std
-                        # You can also skip mean subtraction if you prefer.
                         weight_prime = (weight_prime - mean) / std
 
                     if args.kmean_quantize:
@@ -382,7 +385,8 @@ def quantize_weights(model, args):
                     else:
                         print ("Using standard minmax quantzation for weights")
                         deq_w = quantize_tensor_min_max(weight_prime, args.weight_quantize_bitwidth, signed=True)
-
+                    
+                    # Store transformed and quantized model weights
                     module.weight.data = deq_w
 
                     # Quantize and dequantize bias if present
@@ -395,11 +399,12 @@ def quantize_weights(model, args):
                     module.register_buffer('rht_sign_vector', sign_vector)
                     module.rht_N_padded = N_padded
     else:
+        # Use default minmax Uniform quantization or static quantization, depending on args
         print(f"Applying {'dynamic' if args.dynamic_quantize else 'static'} quantization (W{args.weight_quantize_bitwidth} bits) to the model's Linear and Conv2d layers...")
         for name, module in model.named_modules():
             if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
                 with torch.no_grad():
-                    # Quantize and dequantize weights
+                    # Quantize and dequantize weights to simulate quantization
                     deq_w = quantize_tensor_min_max(module.weight.data, args.weight_quantize_bitwidth, signed=True)
                     module.weight.data.copy_(deq_w)
 
@@ -427,9 +432,13 @@ def quantize_activations(model, args, activation_ranges=None):
         else:
             pass  # No activation quantization
 
-# ===== Helper Functions =====
-
+########################
+# Helper Functions for Quantization:
+########################
 def quantize_tensor_min_max(tensor, num_bits=8, signed=True):
+    """
+   Simple uniform quantization function (either signed or unsigned)
+    """
     if signed:
         qmin = - (2 ** (num_bits - 1))
         qmax = (2 ** (num_bits - 1)) - 1
@@ -470,7 +479,7 @@ def quantize_and_dequantize_tensor(tensor, scale, zero_point, qmin, qmax):
 
 def register_activation_quantization_hooks(model, args, activation_ranges=None):
     """
-    Register activation quantization hooks for dynamic or static quantization.
+    Register activation quantization hooks for random hadamard transformation, dynamic, and static quantization.
     """
     module_to_name = {}
     handles = []
@@ -483,7 +492,6 @@ def register_activation_quantization_hooks(model, args, activation_ranges=None):
         # This pre-hook transforms the input activations using the RHT logic
         # only if rht_sign_vector exists in the module.
         if not hasattr(module, 'rht_sign_vector'):
-            print("FUCK")
             return input
         
         x = input[0]
@@ -508,13 +516,13 @@ def register_activation_quantization_hooks(model, args, activation_ranges=None):
             std = x.std(unbiased=False)
             if std < 1e-8:
                 # If std is tiny, fallback: just quantize directly
-                # or treat all weights as a constant
+                # or treat all activations as a constant
                 std = 1.0
 
             # Normalize: (X - mean) / std
             x = (x - mean) / std
 
-        # Quantize activations
+        # Quantize + dequantize activations
         x = quantize_tensor_min_max(x, num_bits=args.activation_quantize_bitwidth, signed=True)
 
         return (x,)
@@ -524,6 +532,7 @@ def register_activation_quantization_hooks(model, args, activation_ranges=None):
         module_name = module_to_name[module]
 
         if args.dynamic_quantize:
+            # Use standard minmax Uniform quantization
             deq_x = quantize_tensor_min_max(output, num_bits=args.activation_quantize_bitwidth, signed=False)
             return deq_x
         elif args.static_quantize:
@@ -537,6 +546,7 @@ def register_activation_quantization_hooks(model, args, activation_ranges=None):
             qmin = params['qmin']
             qmax = params['qmax']
 
+            # Quantize with calibrated parameters
             deq_x = quantize_and_dequantize_tensor(output, scale, zero_point, qmin, qmax)
             return deq_x
         else:
@@ -553,6 +563,7 @@ def register_activation_quantization_hooks(model, args, activation_ranges=None):
                 handles.append(handle)
     else:
         print ("Registering hooks for normal dynamic/static quantization...")
+        # Add forward hook to all linear and Conv2d layers
         for name, module in model.named_modules():
             if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
                 handle = module.register_forward_hook(activation_quantization_hook)
@@ -561,6 +572,9 @@ def register_activation_quantization_hooks(model, args, activation_ranges=None):
     return handles
 
 def collect_activation_ranges(model, dataloader, num_batches, args):
+    """
+    Helper function to collect activation data for static quantization parameter calibration.
+    """
     activation_ranges = {}
     module_to_name = {}
     handles = []
@@ -669,22 +683,19 @@ def compute_quantization_parameters(activation_ranges, num_bits):
 
     return quantization_params
 
-# ===== Random Hadamard Transform Functions =====
-
+########################
+# Random Hadamard Transformation Helper Functions
+########################
 def generate_random_sign_vector(length, device, dtype):
     """Generate a random sign vector (+1 or -1) of given length."""
     return torch.randint(0, 2, (length,), device=device, dtype=dtype) * 2 - 1  # Random +/-1
 
 def fwht(x):
-    """Fast Walsh-Hadamard Transform along the last dimension without normalization."""
+    """
+    Fast Walsh-Hadamard Transform along the last dimension without normalization.
+    """
     original_shape = x.shape
     N = x.shape[-1]
-    # N_padded = 2 ** int(np.ceil(np.log2(N))) if (N & (N - 1)) != 0 else N
-    # pad_size = N_padded - N if N_padded != N else 0
-
-    # if pad_size > 0:
-    #     x = F.pad(x, (0, pad_size))
-
     x = x.reshape(-1, N)
     batch_dim, d = x.shape
     h = 2
@@ -701,8 +712,9 @@ def fwht(x):
     return (x / np.sqrt(d)).view(*original_shape)
 
 
-# ===== Main Execution =====
-
+########################
+# Main Execution
+########################
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("No GPUs found!")
