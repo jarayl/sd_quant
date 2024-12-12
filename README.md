@@ -25,6 +25,22 @@ For now the only script we have to run is `txt2img.py`, e.g., run the following 
 ```
 python scripts/txt2img.py --prompt "a professional photograph of an astronaut riding a horse" --ckpt checkpoints/v2-1_512-nonema-pruned.ckpt --config configs/stable-diffusion/v2-inference.yaml --device cuda
 ```
+## Running experiments
+
+To run a quantization experiment, first make sure you are using a salloced GPU from the research cluster -- avoid using the login nodes for computation. Then, execute main.py with the desired parser arguments. An example command could be:
+```
+python main.py --checkpoint checkpoints/v2-1_512-nonema-pruned.ckpt --config configs/stable-diffusion/v2-training.yaml --evaluate --rht_quant --dynamic_quantize --kmean_quantize --save_images  --weight_quantize_bitwidth 4 --activation_quantize_bitwidth 8 --eval_samples 50
+```
+
+Note that the checkpoint and config flags should always be given as
+```
+--checkpoint checkpoints/v2-1_512-nonema-pruned.ckpt --config configs/stable-diffusion/v2-training.yaml
+```
+To apply random hadamard rotations to the weights and activations of the model, set the --rht_quant argument. Similarly, to use static or dynamic Uniform quantization to the weights and activations, set the corresponding flag. Note that in this code, static quantization is not compatible with the random hadamard transformations.
+
+ To save the sample images, set the --save_images argument. Intuitively, the weight_quantize_bitwidth and activation_quantize_bitwidth arguments control the number of bits to quantize down to. To apply k-means vector quantization to the weights, set the kmean_quantize argument to true.
+ 
+To evaluate and print the evaluation accuracy (which is CLIP Score), set the --evaluate argument to be true. Be sure to include the evaluation set size with --eval_samples argument.
 
 ## Using the FASRC cluster
 
